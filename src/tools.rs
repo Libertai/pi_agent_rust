@@ -7148,7 +7148,12 @@ struct HashlineEditInput {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct HashlineOp {
-    /// Operation type: "replace", "prepend", or "append"
+    /// Operation type: "replace", "prepend", or "append".
+    /// Defaults to "replace" when the model omits the field — that's
+    /// the dominant case (most edits are in-place replacements at a
+    /// hashline anchor) and several models we tested were happy to send
+    /// `{pos, lines}` without `op` and then bail when the tool errored.
+    #[serde(default = "default_hashline_op")]
     op: String,
     /// Start anchor in "LINE#HASH" format (optional for BOF prepend / EOF append)
     pos: Option<String>,
@@ -7156,6 +7161,10 @@ struct HashlineOp {
     end: Option<String>,
     /// Replacement / insertion lines
     lines: Option<serde_json::Value>,
+}
+
+fn default_hashline_op() -> String {
+    "replace".to_string()
 }
 
 impl HashlineOp {
@@ -7337,11 +7346,11 @@ impl Tool for HashlineEditTool {
                             "op": {
                                 "type": "string",
                                 "enum": ["replace", "prepend", "append"],
-                                "description": "Operation type"
+                                "description": "Operation type. Defaults to \"replace\" if omitted."
                             },
                             "pos": {
                                 "type": "string",
-                                "description": "Anchor line reference in LINE#HASH format (e.g. \"5#KJ\")"
+                                "description": "Anchor line reference in LINE#HASH format (e.g. \"5#KJ\"). Required for replace; optional for prepend (defaults to BOF) and append (defaults to EOF)."
                             },
                             "end": {
                                 "type": "string",
@@ -7356,7 +7365,7 @@ impl Tool for HashlineEditTool {
                                 ]
                             }
                         },
-                        "required": ["op"]
+                        "required": []
                     }
                 }
             },
