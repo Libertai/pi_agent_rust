@@ -1331,6 +1331,22 @@ impl AgentSessionHandle {
         self.session.set_provider_model(provider, model_id).await
     }
 
+    /// Update the persisted session display name.
+    pub async fn set_session_name(&mut self, name: impl Into<String>) -> Result<()> {
+        let name = name.into();
+        let cx = crate::agent_cx::AgentCx::for_request();
+        {
+            let mut guard = self
+                .session
+                .session
+                .lock(cx.cx())
+                .await
+                .map_err(|e| Error::session(e.to_string()))?;
+            guard.append_session_info(Some(name));
+        }
+        self.session.persist_session().await
+    }
+
     /// Return the currently configured thinking level.
     pub const fn thinking_level(&self) -> Option<crate::model::ThinkingLevel> {
         self.session.agent.stream_options().thinking_level
