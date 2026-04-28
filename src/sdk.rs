@@ -1227,6 +1227,35 @@ impl AgentSessionHandle {
             .await
     }
 
+    /// Send one multimodal user prompt through the agent loop.
+    ///
+    /// `content` is the user message body — typically one
+    /// [`ContentBlock::Text`] followed by one or more [`ContentBlock::Image`]
+    /// blocks for vision-capable models. Forwards to
+    /// [`AgentSession::run_with_content`], which already handles input-event
+    /// dispatch and provider-side image splitting.
+    pub async fn prompt_with_content(
+        &mut self,
+        content: Vec<ContentBlock>,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<AssistantMessage> {
+        let combined = self.make_combined_callback(on_event);
+        self.session.run_with_content(content, combined).await
+    }
+
+    /// Send one multimodal user prompt with an explicit abort signal.
+    pub async fn prompt_with_content_with_abort(
+        &mut self,
+        content: Vec<ContentBlock>,
+        abort_signal: AbortSignal,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<AssistantMessage> {
+        let combined = self.make_combined_callback(on_event);
+        self.session
+            .run_with_content_with_abort(content, Some(abort_signal), combined)
+            .await
+    }
+
     /// Continue the current agent loop without adding a new user prompt.
     ///
     /// This is useful for retry/continuation flows where session history or
