@@ -1347,6 +1347,23 @@ impl AgentSessionHandle {
         self.session.persist_session().await
     }
 
+    /// Read the per-prompt `max_tokens` cap currently configured on the
+    /// session's stream options. `None` means "let the provider's
+    /// `DEFAULT_MAX_TOKENS` apply" (4096 for openai-compat as of pi
+    /// 0.1.13), which truncates long generations — set this to a higher
+    /// value when the model needs to emit large tool-call args (e.g. a
+    /// `write` tool carrying a multi-thousand-line file body).
+    pub const fn max_tokens(&self) -> Option<u32> {
+        self.session.agent.stream_options().max_tokens
+    }
+
+    /// Override the per-prompt `max_tokens` cap. Persists for the
+    /// lifetime of the in-process handle; not written to session
+    /// metadata.
+    pub fn set_max_tokens(&mut self, max_tokens: Option<u32>) {
+        self.session.agent.stream_options_mut().max_tokens = max_tokens;
+    }
+
     /// Return the currently configured thinking level.
     pub const fn thinking_level(&self) -> Option<crate::model::ThinkingLevel> {
         self.session.agent.stream_options().thinking_level
