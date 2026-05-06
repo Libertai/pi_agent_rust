@@ -1846,19 +1846,17 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
     };
     if !history.is_empty() {
         agent_session.agent.replace_messages(history);
-        // Re-fire any tool that paused before the previous app
-        // exit. Done outcomes replace the sentinel in agent.messages
-        // and append a fresh ToolResult to the JSONL; Paused results
-        // (user closed the app again pre-answer) leave the sentinel
-        // for the next resume cycle. Errors turn into is_error
-        // ToolResults so the agent can keep going.
-        if let Err(e) = agent_session
-            .agent
-            .resume_paused_tools(&agent_session.session)
-            .await
-        {
-            tracing::warn!(error = %e, "resume_paused_tools failed during create_agent_session; continuing with sentinels in place");
-        }
+        // NOTE: pause-resume is NOT auto-fired here. resume_paused_tools
+        // awaits the user's modal response inline, which would block this
+        // entire create call until they answer; meanwhile the embedder's
+        // FE is still waiting for create_agent_session to return so it
+        // can mount the tab that renders the modal. Deadlock.
+        //
+        // Embedders that want pause-resume must call
+        // [`AgentSessionHandle::resume_paused_tools`] explicitly after
+        // create returns, ideally on a worker thread that owns the
+        // handle so it can block on the user without blocking the
+        // session-create code path.
     }
 
     let mut listeners = EventListeners::new();
