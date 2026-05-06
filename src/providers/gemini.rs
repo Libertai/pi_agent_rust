@@ -1800,6 +1800,7 @@ mod tests {
             details: None,
             is_error: false,
             timestamp: 0,
+            paused: None,
         });
 
         let converted = convert_message_to_gemini(&message);
@@ -1825,6 +1826,7 @@ mod tests {
             details: None,
             is_error: true,
             timestamp: 0,
+            paused: None,
         });
 
         let converted = convert_message_to_gemini(&message);
@@ -1961,6 +1963,7 @@ mod tests {
                     details: None,
                     is_error: false,
                     timestamp: 2,
+                    paused: None,
                 }),
             ],
             vec![ToolDef {

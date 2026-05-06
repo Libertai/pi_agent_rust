@@ -243,6 +243,7 @@ fn test_tool_result_message_round_trip() {
         })),
         is_error: false,
         timestamp: 1_700_000_000,
+        paused: None,
     });
 
     let json = serde_json::to_string(&msg).unwrap();
@@ -281,6 +282,7 @@ fn test_tool_result_error() {
         details: None,
         is_error: true,
         timestamp: 1_700_000_000,
+        paused: None,
     });
 
     let json = serde_json::to_string(&msg).unwrap();
@@ -307,6 +309,7 @@ fn test_tool_result_details_omitted_when_none() {
         details: None,
         is_error: false,
         timestamp: 1_700_000_000,
+        paused: None,
     });
 
     let json = serde_json::to_string(&msg).unwrap();
@@ -1168,6 +1171,7 @@ fn test_multiple_tool_results() {
             details: Some(json!({"lines": 1})),
             is_error: false,
             timestamp: 1_700_000_001,
+            paused: None,
         }),
         Message::tool_result(ToolResultMessage {
             tool_call_id: "call_2".to_string(),
@@ -1178,6 +1182,7 @@ fn test_multiple_tool_results() {
             details: Some(json!({"matches": 1})),
             is_error: false,
             timestamp: 1_700_000_002,
+            paused: None,
         }),
     ];
 

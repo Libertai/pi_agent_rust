@@ -17,7 +17,7 @@ use crate::extensions::JsExtensionRuntimeHandle;
 use crate::extensions::WasmExtensionHandle;
 use crate::extensions::{ExtensionManager, ExtensionRuntimeHandle};
 use crate::extensions_js::ExtensionToolDef;
-use crate::tools::{Tool, ToolOutput, ToolUpdate};
+use crate::tools::{Tool, ToolExecution, ToolOutput, ToolUpdate};
 #[cfg(feature = "wasm-host")]
 use asupersync::time::{timeout, wall_now};
 
@@ -180,7 +180,7 @@ impl Tool for ExtensionToolWrapper {
         tool_call_id: &str,
         input: Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
-    ) -> Result<ToolOutput> {
+    ) -> Result<ToolExecution> {
         let result = self
             .runtime
             .execute_tool_ref(
@@ -193,12 +193,13 @@ impl Tool for ExtensionToolWrapper {
             .await
             .map_err(|err| Error::tool(self.name(), err.to_string()))?;
 
-        serde_json::from_value(result).map_err(|err| {
+        let output: ToolOutput = serde_json::from_value(result).map_err(|err| {
             Error::tool(
                 self.name(),
                 format!("Invalid extension tool output (expected ToolOutput JSON): {err}"),
             )
-        })
+        })?;
+        Ok(ToolExecution::Done(output))
     }
 }
 
@@ -226,7 +227,7 @@ impl Tool for WasmExtensionToolWrapper {
         _tool_call_id: &str,
         input: Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
-    ) -> Result<ToolOutput> {
+    ) -> Result<ToolExecution> {
         let fut = self.handle.handle_tool(&self.def.name, &input);
         let output_json = if self.timeout_ms > 0 {
             match timeout(
@@ -253,12 +254,13 @@ impl Tool for WasmExtensionToolWrapper {
         }
         .map_err(|err| Error::tool(self.name(), err.to_string()))?;
 
-        serde_json::from_str(&output_json).map_err(|err| {
+        let output: ToolOutput = serde_json::from_str(&output_json).map_err(|err| {
             Error::tool(
                 self.name(),
                 format!("Invalid WASM tool output (expected ToolOutput JSON): {err}"),
             )
-        })
+        })?;
+        Ok(ToolExecution::Done(output))
     }
 }
 
@@ -394,10 +396,9 @@ mod tests {
                 "cwd": temp_dir.path().display().to_string()
             }));
 
-            let output = wrapper
+            let output = match wrapper
                 .execute("call-1", json!({ "name": "pi" }), None)
-                .await
-                .expect("execute tool");
+                .await.expect("execute tool") { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
 
             assert!(!output.is_error);
 
@@ -984,10 +985,9 @@ mod tests {
             let (_temp_dir, _manager, js_runtime, def) = setup_js_tool(source, "empty_tool").await;
 
             let wrapper = ExtensionToolWrapper::new(def, js_runtime);
-            let output = wrapper
+            let output = match wrapper
                 .execute("call-1", json!({}), None)
-                .await
-                .expect("execute tool");
+                .await.expect("execute tool") { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
 
             assert!(!output.is_error);
             assert!(output.content.is_empty());
@@ -1017,10 +1017,9 @@ mod tests {
             let (_temp_dir, _manager, js_runtime, def) = setup_js_tool(source, "error_tool").await;
 
             let wrapper = ExtensionToolWrapper::new(def, js_runtime);
-            let output = wrapper
+            let output = match wrapper
                 .execute("call-1", json!({}), None)
-                .await
-                .expect("execute tool");
+                .await.expect("execute tool") { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
 
             assert!(output.is_error);
             match output.content.as_slice() {
@@ -1055,10 +1054,9 @@ mod tests {
             let (_temp_dir, _manager, js_runtime, def) = setup_js_tool(source, "echo_tool").await;
 
             let wrapper = ExtensionToolWrapper::new(def, js_runtime);
-            let output = wrapper
+            let output = match wrapper
                 .execute("call-1", json!({"msg": "hello world"}), None)
-                .await
-                .expect("execute tool");
+                .await.expect("execute tool") { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
 
             assert!(!output.is_error);
             match output.content.as_slice() {

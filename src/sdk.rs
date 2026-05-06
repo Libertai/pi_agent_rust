@@ -54,7 +54,7 @@ pub use crate::provider::{
     ThinkingBudgets as ProviderThinkingBudgets, ToolDef,
 };
 pub use crate::session::Session;
-pub use crate::tools::{Tool, ToolOutput, ToolRegistry, ToolUpdate};
+pub use crate::tools::{Tool, ToolExecution, ToolOutput, ToolRegistry, ToolUpdate};
 
 /// Stable alias for model-exposed tool schema definitions.
 pub type ToolDefinition = ToolDef;
@@ -1200,6 +1200,21 @@ impl AgentSessionHandle {
         Self { session, listeners }
     }
 
+    /// Re-fire `Tool::resume` for any paused sentinel tool result in
+    /// the current message history. Returns the count of resolved
+    /// pauses (Done outcomes); paused-again or errored tools are
+    /// represented in the history but not counted.
+    ///
+    /// `create_agent_session` already calls this once after rehydrating
+    /// history; embedders only need to call it explicitly when they
+    /// want to retry pauses outside the normal session-create path
+    /// (for example after the user re-attaches a previously-detached
+    /// session from a separate webview).
+    pub async fn resume_paused_tools(&mut self) -> Result<usize> {
+        let session_arc = Arc::clone(&self.session.session);
+        self.session.agent.resume_paused_tools(&session_arc).await
+    }
+
     /// Send one user prompt through the agent loop.
     ///
     /// The `on_event` callback receives events for this prompt only.
@@ -1871,6 +1886,19 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
     };
     if !history.is_empty() {
         agent_session.agent.replace_messages(history);
+        // Re-fire any tool that paused before the previous app
+        // exit. Done outcomes replace the sentinel in agent.messages
+        // and append a fresh ToolResult to the JSONL; Paused results
+        // (user closed the app again pre-answer) leave the sentinel
+        // for the next resume cycle. Errors turn into is_error
+        // ToolResults so the agent can keep going.
+        if let Err(e) = agent_session
+            .agent
+            .resume_paused_tools(&agent_session.session)
+            .await
+        {
+            tracing::warn!(error = %e, "resume_paused_tools failed during create_agent_session; continuing with sentinels in place");
+        }
     }
 
     let mut listeners = EventListeners::new();

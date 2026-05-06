@@ -45,7 +45,7 @@ use crate::models::{
 use crate::provider::{Context, Provider, StreamOptions, ToolDef};
 use crate::semantic_workspace_graph::{ContextBundleItem, SemanticContextBundle};
 use crate::session::{AutosaveFlushTrigger, Session, SessionHandle};
-use crate::tools::{Tool, ToolEffects, ToolOutput, ToolRegistry, ToolUpdate};
+use crate::tools::{Tool, ToolEffects, ToolExecution, ToolOutput, ToolRegistry, ToolUpdate};
 use asupersync::runtime::{Runtime, RuntimeBuilder, RuntimeHandle};
 use asupersync::sync::{Mutex, Notify};
 use async_trait::async_trait;
@@ -1183,6 +1183,95 @@ impl Agent {
         self.messages = messages;
     }
 
+    /// Walk the in-memory history for ToolResults that carry the `paused`
+    /// sentinel and re-fire each tool's `Tool::resume` hook. On Done, the
+    /// sentinel message is replaced in-place in `self.messages` and a fresh
+    /// ToolResult (no `paused` field) is appended to the persistent session.
+    /// On Paused-again the sentinel is left intact (user closed app a second
+    /// time before answering). Returns the count of resolved pauses.
+    pub async fn resume_paused_tools(
+        &mut self,
+        session: &Arc<Mutex<Session>>,
+    ) -> Result<usize> {
+        let mut to_resume: Vec<(usize, String, String, String, serde_json::Value)> = Vec::new();
+        for (idx, msg) in self.messages.iter().enumerate() {
+            if let Message::ToolResult(tr) = msg {
+                if let Some(paused) = &tr.paused {
+                    to_resume.push((
+                        idx,
+                        tr.tool_name.clone(),
+                        tr.tool_call_id.clone(),
+                        paused.request_id.clone(),
+                        paused.payload.clone(),
+                    ));
+                }
+            }
+        }
+        if to_resume.is_empty() {
+            return Ok(0);
+        }
+        let mut resolved = 0_usize;
+        for (idx, tool_name, tool_call_id, request_id, payload) in to_resume {
+            let outcome = match self.tools.get(&tool_name) {
+                Some(tool) => tool.resume(&tool_call_id, &request_id, payload).await,
+                None => Err(Error::tool(
+                    tool_name.clone(),
+                    "tool not found in registry on resume",
+                )),
+            };
+            let new_result = match outcome {
+                Ok(ToolExecution::Done(output)) => {
+                    let is_error = output.is_error;
+                    ToolResultMessage {
+                        tool_call_id: tool_call_id.clone(),
+                        tool_name: tool_name.clone(),
+                        content: output.content,
+                        details: output.details,
+                        is_error,
+                        timestamp: Utc::now().timestamp_millis(),
+                        paused: None,
+                    }
+                }
+                Ok(ToolExecution::Paused { .. }) => continue,
+                Err(e) => ToolResultMessage {
+                    tool_call_id: tool_call_id.clone(),
+                    tool_name: tool_name.clone(),
+                    content: vec![ContentBlock::Text(TextContent::new(format!(
+                        "Error resuming paused tool: {e}"
+                    )))],
+                    details: None,
+                    is_error: true,
+                    timestamp: Utc::now().timestamp_millis(),
+                    paused: None,
+                },
+            };
+            let arc_result = Arc::new(new_result.clone());
+            if let Some(slot) = self.messages.get_mut(idx) {
+                *slot = Message::ToolResult(Arc::clone(&arc_result));
+            }
+            {
+                let cx = crate::agent_cx::AgentCx::for_current_or_request();
+                let mut guard = session
+                    .lock(cx.cx())
+                    .await
+                    .map_err(|e| Error::session(e.to_string()))?;
+                guard.append_message(crate::session::SessionMessage::ToolResult {
+                    tool_call_id: new_result.tool_call_id,
+                    tool_name: new_result.tool_name,
+                    content: new_result.content,
+                    details: new_result.details,
+                    is_error: new_result.is_error,
+                    timestamp: Some(new_result.timestamp),
+                    paused: None,
+                });
+            }
+            if !arc_result.is_error {
+                resolved += 1;
+            }
+        }
+        Ok(resolved)
+    }
+
     /// Replace the provider implementation (used for model/provider switching).
     pub fn set_provider(&mut self, provider: Arc<dyn Provider>) {
         self.provider = provider;
@@ -1491,7 +1580,7 @@ impl Agent {
         // Delivery boundary: start of turn (steering messages queued while idle).
         let mut pending_messages = self.drain_steering_messages().await;
 
-        loop {
+        'outer: loop {
             let mut has_more_tool_calls = true;
             let mut steering_after_tools: Option<Vec<Message>> = None;
 
@@ -1808,6 +1897,32 @@ impl Agent {
                     };
                     tool_results = outcome.tool_results;
                     steering_after_tools = outcome.steering_messages;
+
+                    // Pause primitive: at least one tool returned
+                    // ToolExecution::Paused. The sentinel ToolResult
+                    // entries are already in self.messages /
+                    // new_messages; emit TurnEnd and break out of
+                    // the run_loop without firing the next provider
+                    // call. Resume happens via Tool::resume on the
+                    // next session start (auto-called from
+                    // create_agent_session via Agent::resume_paused_tools).
+                    if outcome.paused_any {
+                        let tool_messages: Vec<Message> = tool_results
+                            .iter()
+                            .map(|r| Message::ToolResult(Arc::clone(r)))
+                            .collect();
+                        let turn_end_event = AgentEvent::TurnEnd {
+                            session_id: session_id.clone(),
+                            turn_index: current_turn_index,
+                            message: assistant_event_message.clone(),
+                            tool_results: tool_messages,
+                            latency_breakdown: snapshot_turn_latency(&turn_latency),
+                        };
+                        self.dispatch_extension_lifecycle_event(&turn_end_event)
+                            .await;
+                        on_event(turn_end_event);
+                        break 'outer;
+                    }
                 }
 
                 let tool_messages = tool_results
@@ -2667,7 +2782,7 @@ impl Agent {
         on_event: AgentEventHandler,
         abort: Option<AbortSignal>,
         latency: SharedTurnLatencyAccumulator,
-    ) -> Vec<(usize, (ToolOutput, bool))> {
+    ) -> Vec<(usize, ToolRunResult)> {
         let parallelism = compatible_tool_parallelism_limit();
         let futures = batch.into_iter().map(|(idx, tc)| {
             let on_event = Arc::clone(&on_event);
@@ -2729,6 +2844,7 @@ impl Agent {
         let effect_batches = plan_tool_effect_batches(&effect_plan);
         let mut recorded_results: Vec<Option<Arc<ToolResultMessage>>> =
             vec![None; tool_calls.len()];
+        let mut paused_any = false;
 
         for effect_batch in effect_batches {
             if abort.as_ref().is_some_and(AbortSignal::is_aborted) {
@@ -2758,14 +2874,47 @@ impl Agent {
                 )
                 .await;
             batch_results.sort_by_key(|(idx, _)| *idx);
-            for (idx, (output, is_error)) in batch_results {
+            for (idx, run) in batch_results {
                 if let (Some(tool_call), Some(recorded_result)) =
                     (tool_calls.get(idx), recorded_results.get_mut(idx))
                 {
+                    let (output, is_error, paused) = match run {
+                        ToolRunResult::Done { output, is_error } => (output, is_error, None),
+                        ToolRunResult::Paused {
+                            request_id,
+                            kind,
+                            payload,
+                        } => {
+                            // Sentinel content keeps the JSONL transcript
+                            // valid (every tool_call has a tool_result)
+                            // without leaking a fake answer to the LLM:
+                            // the agent loop exits before the next provider
+                            // call. resume_paused_tools (auto from
+                            // create_agent_session) re-fires Tool::resume
+                            // on next session start.
+                            paused_any = true;
+                            (
+                                ToolOutput {
+                                    content: vec![ContentBlock::Text(TextContent::new(
+                                        "tool paused, awaiting resume",
+                                    ))],
+                                    details: None,
+                                    is_error: false,
+                                },
+                                false,
+                                Some(crate::model::PausedToolResult {
+                                    request_id,
+                                    kind,
+                                    payload,
+                                }),
+                            )
+                        }
+                    };
                     *recorded_result = Some(self.record_tool_result(
                         tool_call,
                         output,
                         is_error,
+                        paused,
                         &on_event,
                         new_messages,
                     ));
@@ -2833,6 +2982,7 @@ impl Agent {
                     details: output.details,
                     is_error: true,
                     timestamp: Utc::now().timestamp_millis(),
+                    paused: None,
                 });
 
                 let msg = Message::ToolResult(Arc::clone(&tool_result));
@@ -2851,6 +3001,7 @@ impl Agent {
         Ok(ToolExecutionOutcome {
             tool_results: results,
             steering_messages,
+            paused_any,
         })
     }
 
@@ -2859,6 +3010,7 @@ impl Agent {
         tool_call: &ToolCall,
         output: ToolOutput,
         is_error: bool,
+        paused: Option<crate::model::PausedToolResult>,
         on_event: &AgentEventHandler,
         new_messages: &mut Vec<Message>,
     ) -> Arc<ToolResultMessage> {
@@ -2880,6 +3032,7 @@ impl Agent {
             details: output.details,
             is_error,
             timestamp: Utc::now().timestamp_millis(),
+            paused,
         });
 
         on_event(AgentEvent::ToolExecutionEnd {
@@ -2909,15 +3062,18 @@ impl Agent {
         tool_call: ToolCall,
         on_event: AgentEventHandler,
         latency: SharedTurnLatencyAccumulator,
-    ) -> (ToolOutput, bool) {
+    ) -> ToolRunResult {
         let extensions = self.extensions.clone();
 
         let approval_denied_output = self
             .request_tool_approval(&tool_call, Arc::clone(&on_event))
             .await;
 
-        let (mut output, is_error) = if let Some(output) = approval_denied_output {
-            (output, true)
+        let run = if let Some(output) = approval_denied_output {
+            ToolRunResult::Done {
+                output,
+                is_error: true,
+            }
         } else if let Some(extensions) = &extensions {
             let hook_started_at = Instant::now();
             let hook_outcome = Self::dispatch_tool_call_hook(
@@ -2928,15 +3084,19 @@ impl Agent {
             .await;
             record_extension_hostcall_latency(&latency, hook_started_at.elapsed());
 
-            if let Some(blocked_output) = hook_outcome {
-                (blocked_output, true)
-            } else {
-                let tool_started_at = Instant::now();
-                let outcome = self
-                    .execute_tool_without_hooks(&tool_call, Arc::clone(&on_event))
-                    .await;
-                record_local_tool_latency(&latency, tool_started_at.elapsed());
-                outcome
+            match hook_outcome {
+                Some(blocked_output) => ToolRunResult::Done {
+                    output: blocked_output,
+                    is_error: true,
+                },
+                None => {
+                    let tool_started_at = Instant::now();
+                    let outcome = self
+                        .execute_tool_without_hooks(&tool_call, Arc::clone(&on_event))
+                        .await;
+                    record_local_tool_latency(&latency, tool_started_at.elapsed());
+                    outcome
+                }
             }
         } else {
             let tool_started_at = Instant::now();
@@ -2947,13 +3107,20 @@ impl Agent {
             outcome
         };
 
-        if let Some(extensions) = &extensions {
-            let hook_started_at = Instant::now();
-            Self::apply_tool_result_hook(extensions, &tool_call, &mut output, is_error).await;
-            record_extension_hostcall_latency(&latency, hook_started_at.elapsed());
+        // Tool-result hook only applies to completed outputs; pauses
+        // bypass it (the hook fires on the resume's Done result).
+        match run {
+            ToolRunResult::Done { mut output, is_error } => {
+                if let Some(extensions) = &extensions {
+                    let hook_started_at = Instant::now();
+                    Self::apply_tool_result_hook(extensions, &tool_call, &mut output, is_error)
+                        .await;
+                    record_extension_hostcall_latency(&latency, hook_started_at.elapsed());
+                }
+                ToolRunResult::Done { output, is_error }
+            }
+            paused => paused,
         }
-
-        (output, is_error)
     }
 
     async fn request_tool_approval(
@@ -2999,7 +3166,7 @@ impl Agent {
         tool_call: ToolCall,
         on_event: AgentEventHandler,
         latency: SharedTurnLatencyAccumulator,
-    ) -> (ToolOutput, bool) {
+    ) -> ToolRunResult {
         self.execute_tool(tool_call, on_event, latency).await
     }
 
@@ -3007,10 +3174,13 @@ impl Agent {
         &self,
         tool_call: &ToolCall,
         on_event: AgentEventHandler,
-    ) -> (ToolOutput, bool) {
+    ) -> ToolRunResult {
         // Find the tool
         let Some(tool) = self.tools.get(&tool_call.name) else {
-            return (Self::tool_not_found_output(&tool_call.name), true);
+            return ToolRunResult::Done {
+                output: Self::tool_not_found_output(&tool_call.name),
+                is_error: true,
+            };
         };
 
         let tool_name = tool_call.name.clone();
@@ -3048,18 +3218,27 @@ impl Agent {
             )
             .await
         {
-            Ok(output) => {
+            Ok(ToolExecution::Done(output)) => {
                 let is_error = output.is_error;
-                (output, is_error)
+                ToolRunResult::Done { output, is_error }
             }
-            Err(e) => (
-                ToolOutput {
+            Ok(ToolExecution::Paused {
+                request_id,
+                kind,
+                payload,
+            }) => ToolRunResult::Paused {
+                request_id,
+                kind,
+                payload,
+            },
+            Err(e) => ToolRunResult::Done {
+                output: ToolOutput {
                     content: vec![ContentBlock::Text(TextContent::new(format!("Error: {e}")))],
                     details: None,
                     is_error: true,
                 },
-                true,
-            ),
+                is_error: true,
+            },
         }
     }
 
@@ -3207,6 +3386,7 @@ impl Agent {
             details: output.details,
             is_error: true,
             timestamp: Utc::now().timestamp_millis(),
+            paused: None,
         });
 
         let msg = Message::ToolResult(Arc::clone(&tool_result));
@@ -3229,6 +3409,29 @@ impl Agent {
 struct ToolExecutionOutcome {
     tool_results: Vec<Arc<ToolResultMessage>>,
     steering_messages: Option<Vec<Message>>,
+    /// True when at least one tool returned ToolExecution::Paused. The
+    /// outer `run_loop` checks this and breaks `'outer` so the next LLM
+    /// call doesn't fire — the conversation rests on the sentinel
+    /// ToolResults until Tool::resume is invoked (via
+    /// Agent::resume_paused_tools on session resume).
+    paused_any: bool,
+}
+
+/// Per-call result from `execute_tool_without_hooks` / `execute_tool`.
+/// Widens the prior `(ToolOutput, bool)` to also carry a pause sentinel
+/// — Phase 3 of `execute_tool_calls` translates `Paused` into a paused
+/// ToolResultMessage and flips `paused_any`.
+#[derive(Debug, Clone)]
+enum ToolRunResult {
+    Done {
+        output: ToolOutput,
+        is_error: bool,
+    },
+    Paused {
+        request_id: String,
+        kind: String,
+        payload: serde_json::Value,
+    },
 }
 
 /// Pre-created extension runtime state for overlapping startup I/O.
@@ -4045,6 +4248,7 @@ mod tool_effect_batch_planning_tests {
             })),
             is_error,
             timestamp: 42,
+            paused: None,
         }
     }
 
@@ -4586,13 +4790,14 @@ mod extensions_integration_tests {
             _tool_call_id: &str,
             _input: serde_json::Value,
             _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
-        ) -> Result<ToolOutput> {
+        ) -> Result<ToolExecution> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(ToolOutput {
                 content: vec![ContentBlock::Text(TextContent::new("ok"))],
                 details: None,
                 is_error: false,
-            })
+            }
+            .into())
         }
     }
 
@@ -4747,10 +4952,9 @@ mod extensions_integration_tests {
                 .get("hello_tool")
                 .expect("hello_tool registered");
 
-            let output = tool
+            let output = match tool
                 .execute("call-1", json!({ "name": "pi" }), None)
-                .await
-                .expect("execute tool");
+                .await.expect("execute tool") { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
 
             assert!(!output.is_error);
             assert!(
@@ -5738,10 +5942,14 @@ mod extensions_integration_tests {
             };
 
             let on_event: Arc<dyn Fn(AgentEvent) + Send + Sync> = Arc::new(|_| {});
-            let (output, is_error) = agent_session
+            let (output, is_error) = match agent_session
                 .agent
                 .execute_tool(tool_call, on_event, test_turn_latency())
-                .await;
+                .await
+            {
+                ToolRunResult::Done { output, is_error } => (output, is_error),
+                _ => panic!("expected Done"),
+            };
 
             assert!(is_error);
             assert!(output.is_error);
@@ -5803,10 +6011,14 @@ mod extensions_integration_tests {
             };
 
             let on_event: Arc<dyn Fn(AgentEvent) + Send + Sync> = Arc::new(|_| {});
-            let (output, is_error) = agent_session
+            let (output, is_error) = match agent_session
                 .agent
                 .execute_tool(tool_call, on_event, test_turn_latency())
-                .await;
+                .await
+            {
+                ToolRunResult::Done { output, is_error } => (output, is_error),
+                _ => panic!("expected Done"),
+            };
 
             assert!(!is_error);
             assert!(!output.is_error);
@@ -5865,10 +6077,14 @@ mod extensions_integration_tests {
             };
 
             let on_event: Arc<dyn Fn(AgentEvent) + Send + Sync> = Arc::new(|_| {});
-            let (output, is_error) = agent_session
+            let (output, is_error) = match agent_session
                 .agent
                 .execute_tool(tool_call, on_event, test_turn_latency())
-                .await;
+                .await
+            {
+                ToolRunResult::Done { output, is_error } => (output, is_error),
+                _ => panic!("expected Done"),
+            };
 
             assert!(is_error);
             assert!(output.is_error);
@@ -5925,10 +6141,14 @@ mod extensions_integration_tests {
             };
 
             let on_event: Arc<dyn Fn(AgentEvent) + Send + Sync> = Arc::new(|_| {});
-            let (output, is_error) = agent_session
+            let (output, is_error) = match agent_session
                 .agent
                 .execute_tool(tool_call, on_event, test_turn_latency())
-                .await;
+                .await
+            {
+                ToolRunResult::Done { output, is_error } => (output, is_error),
+                _ => panic!("expected Done"),
+            };
 
             assert!(!is_error);
             assert!(!output.is_error);
@@ -6105,10 +6325,14 @@ mod extensions_integration_tests {
             };
 
             let on_event: Arc<dyn Fn(AgentEvent) + Send + Sync> = Arc::new(|_| {});
-            let (output, is_error) = agent_session
+            let (output, is_error) = match agent_session
                 .agent
                 .execute_tool(tool_call, on_event, test_turn_latency())
-                .await;
+                .await
+            {
+                ToolRunResult::Done { output, is_error } => (output, is_error),
+                _ => panic!("expected Done"),
+            };
 
             assert!(!is_error);
             assert!(!output.is_error);
@@ -6159,10 +6383,14 @@ mod extensions_integration_tests {
             };
 
             let on_event: Arc<dyn Fn(AgentEvent) + Send + Sync> = Arc::new(|_| {});
-            let (output, is_error) = agent_session
+            let (output, is_error) = match agent_session
                 .agent
                 .execute_tool(tool_call, on_event, test_turn_latency())
-                .await;
+                .await
+            {
+                ToolRunResult::Done { output, is_error } => (output, is_error),
+                _ => panic!("expected Done"),
+            };
 
             assert!(is_error);
             assert!(output.is_error);
@@ -6232,10 +6460,14 @@ mod extensions_integration_tests {
             };
 
             let on_event: Arc<dyn Fn(AgentEvent) + Send + Sync> = Arc::new(|_| {});
-            let (output, is_error) = agent_session
+            let (output, is_error) = match agent_session
                 .agent
                 .execute_tool(tool_call, on_event, test_turn_latency())
-                .await;
+                .await
+            {
+                ToolRunResult::Done { output, is_error } => (output, is_error),
+                _ => panic!("expected Done"),
+            };
 
             assert!(!is_error);
             assert!(!output.is_error);
@@ -6300,10 +6532,14 @@ mod extensions_integration_tests {
             };
 
             let on_event: Arc<dyn Fn(AgentEvent) + Send + Sync> = Arc::new(|_| {});
-            let (output, is_error) = agent_session
+            let (output, is_error) = match agent_session
                 .agent
                 .execute_tool(tool_call, on_event, test_turn_latency())
-                .await;
+                .await
+            {
+                ToolRunResult::Done { output, is_error } => (output, is_error),
+                _ => panic!("expected Done"),
+            };
 
             assert!(is_error);
             assert!(output.is_error);
@@ -6364,10 +6600,14 @@ mod extensions_integration_tests {
             };
 
             let on_event: Arc<dyn Fn(AgentEvent) + Send + Sync> = Arc::new(|_| {});
-            let (output, is_error) = agent_session
+            let (output, is_error) = match agent_session
                 .agent
                 .execute_tool(tool_call, on_event, test_turn_latency())
-                .await;
+                .await
+            {
+                ToolRunResult::Done { output, is_error } => (output, is_error),
+                _ => panic!("expected Done"),
+            };
 
             assert!(!is_error);
             assert!(!output.is_error);
@@ -6439,10 +6679,14 @@ mod extensions_integration_tests {
             };
 
             let on_event: Arc<dyn Fn(AgentEvent) + Send + Sync> = Arc::new(|_| {});
-            let (output, is_error) = agent_session
+            let (output, is_error) = match agent_session
                 .agent
                 .execute_tool(tool_call, on_event, test_turn_latency())
-                .await;
+                .await
+            {
+                ToolRunResult::Done { output, is_error } => (output, is_error),
+                _ => panic!("expected Done"),
+            };
 
             assert!(is_error);
             assert!(output.is_error);
@@ -6464,7 +6708,7 @@ mod extensions_integration_tests {
 mod abort_tests {
     use super::*;
     use crate::session::Session;
-    use crate::tools::{Tool, ToolOutput, ToolRegistry, ToolUpdate};
+    use crate::tools::{Tool, ToolExecution, ToolRegistry, ToolUpdate};
     use asupersync::runtime::RuntimeBuilder;
     use async_trait::async_trait;
     use futures::Stream;
@@ -6723,7 +6967,7 @@ mod abort_tests {
             _tool_call_id: &str,
             _input: serde_json::Value,
             _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
-        ) -> crate::error::Result<ToolOutput> {
+        ) -> crate::error::Result<ToolExecution> {
             futures::future::pending::<()>().await;
             unreachable!("hanging tool should be aborted by the agent")
         }
@@ -7189,7 +7433,7 @@ mod abort_tests {
 mod turn_event_tests {
     use super::*;
     use crate::session::Session;
-    use crate::tools::{Tool, ToolOutput, ToolRegistry, ToolUpdate};
+    use crate::tools::{Tool, ToolExecution, ToolOutput, ToolRegistry, ToolUpdate};
     use asupersync::runtime::RuntimeBuilder;
     use async_trait::async_trait;
     use futures::Stream;
@@ -7305,12 +7549,13 @@ mod turn_event_tests {
             _tool_call_id: &str,
             _input: serde_json::Value,
             _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
-        ) -> Result<ToolOutput> {
+        ) -> Result<ToolExecution> {
             Ok(ToolOutput {
                 content: vec![ContentBlock::Text(TextContent::new("tool-ok"))],
                 details: None,
                 is_error: false,
-            })
+            }
+            .into())
         }
     }
 
@@ -11232,6 +11477,7 @@ mod tests {
                 details: None,
                 is_error: false,
                 timestamp: 0,
+                paused: None,
             }),
         ];
 

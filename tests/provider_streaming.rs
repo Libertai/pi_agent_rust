@@ -919,6 +919,7 @@ pub(crate) fn tool_result_message(
         details: None,
         is_error,
         timestamp: 0,
+        paused: None,
     }))
 }
 

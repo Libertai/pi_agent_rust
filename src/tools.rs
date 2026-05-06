@@ -172,14 +172,30 @@ pub trait Tool: Send + Sync {
     /// Execute the tool.
     ///
     /// Tools may call `on_update` to stream incremental results (e.g. while a long-running `bash`
-    /// command is still producing output). The final return value is a [`ToolOutput`] which is
-    /// persisted into the session as a tool result message.
+    /// command is still producing output). The final return value is a [`ToolExecution`] which is
+    /// either a normal [`ToolOutput`] (persisted into the session as a tool result message) or a
+    /// [`ToolExecution::Paused`] sentinel that suspends the agent loop until [`Tool::resume`] is
+    /// invoked.
     async fn execute(
         &self,
         tool_call_id: &str,
         input: serde_json::Value,
         on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
-    ) -> Result<ToolOutput>;
+    ) -> Result<ToolExecution>;
+
+    /// Resume a previously paused tool invocation. Default impl returns an error; tools that
+    /// ever return [`ToolExecution::Paused`] from [`Tool::execute`] must override this.
+    async fn resume(
+        &self,
+        _tool_call_id: &str,
+        _request_id: &str,
+        _payload: serde_json::Value,
+    ) -> Result<ToolExecution> {
+        Err(crate::error::Error::tool(
+            self.name().to_string(),
+            "tool does not support resume",
+        ))
+    }
 
     /// Declare the coarse side effects used by the agent scheduler.
     ///
@@ -187,6 +203,28 @@ pub trait Tool: Send + Sync {
     #[must_use]
     fn effects(&self) -> ToolEffects {
         ToolEffects::write()
+    }
+}
+
+/// What [`Tool::execute`] returns. A tool either produces a final
+/// [`ToolOutput`] or returns [`ToolExecution::Paused`], asking the
+/// agent loop to suspend until an external event is received.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "_outcome")]
+pub enum ToolExecution {
+    #[serde(rename = "done")]
+    Done(ToolOutput),
+    #[serde(rename = "paused")]
+    Paused {
+        request_id: String,
+        kind: String,
+        payload: serde_json::Value,
+    },
+}
+
+impl From<ToolOutput> for ToolExecution {
+    fn from(value: ToolOutput) -> Self {
+        Self::Done(value)
     }
 }
 
@@ -2840,7 +2878,7 @@ impl Tool for ReadTool {
         tool_call_id: &str,
         input: serde_json::Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
-    ) -> Result<ToolOutput> {
+    ) -> Result<ToolExecution> {
         let input_value = input.clone();
         let input: ReadInput =
             serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
@@ -2873,7 +2911,7 @@ impl Tool for ReadTool {
         let cache_mode = ToolCacheFingerprintMode::FileContent;
         let cache_deps = cache_dependency_for_path(&path, cache_mode);
         if let Some(output) = cached_tool_output(&cache_key, cache_deps.as_deref()) {
-            return Ok(output);
+            return Ok(output.into());
         }
 
         let mut file = asupersync::fs::File::open(&path)
@@ -2999,7 +3037,7 @@ impl Tool for ReadTool {
                 ],
                 details: None,
                 is_error: false,
-            });
+            }.into());
         }
 
         // Text path: optimized streaming read.
@@ -3128,7 +3166,7 @@ impl Tool for ReadTool {
                 stable_cache_dependency_for_path(&path, cache_mode, cache_deps.as_deref()),
                 &output,
             );
-            return Ok(output);
+            return Ok(output.into());
         }
 
         // Now we have the content (up to safety limit) in memory, but only for the requested window.
@@ -3275,7 +3313,7 @@ impl Tool for ReadTool {
             stable_cache_dependency_for_path(&path, cache_mode, cache_deps.as_deref()),
             &output,
         );
-        Ok(output)
+        Ok(output.into())
     }
 }
 
@@ -3751,7 +3789,7 @@ impl Tool for BashTool {
         tool_call_id: &str,
         input: serde_json::Value,
         on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
-    ) -> Result<ToolOutput> {
+    ) -> Result<ToolExecution> {
         let input: BashInput =
             serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
 
@@ -3808,7 +3846,7 @@ impl Tool for BashTool {
             content: vec![ContentBlock::Text(TextContent::new(output_text))],
             details,
             is_error,
-        })
+        }.into())
     }
 }
 
@@ -4441,7 +4479,7 @@ impl Tool for EditTool {
         _tool_call_id: &str,
         input: serde_json::Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
-    ) -> Result<ToolOutput> {
+    ) -> Result<ToolExecution> {
         let input: EditInput =
             serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
 
@@ -4714,7 +4752,7 @@ impl Tool for EditTool {
             )))],
             details: Some(serde_json::Value::Object(details)),
             is_error: false,
-        })
+        }.into())
     }
 }
 
@@ -4778,7 +4816,7 @@ impl Tool for WriteTool {
         _tool_call_id: &str,
         input: serde_json::Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
-    ) -> Result<ToolOutput> {
+    ) -> Result<ToolExecution> {
         let input: WriteInput =
             serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
 
@@ -4866,7 +4904,7 @@ impl Tool for WriteTool {
             )))],
             details: None,
             is_error: false,
-        })
+        }.into())
     }
 }
 
@@ -5082,7 +5120,7 @@ impl Tool for GrepTool {
         tool_call_id: &str,
         input: serde_json::Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
-    ) -> Result<ToolOutput> {
+    ) -> Result<ToolExecution> {
         let input_value = input.clone();
         let input: GrepInput =
             serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
@@ -5126,7 +5164,7 @@ impl Tool for GrepTool {
         };
         let cache_deps = cache_dependency_for_path(&search_path, cache_mode);
         if let Some(output) = cached_tool_output(&cache_key, cache_deps.as_deref()) {
-            return Ok(output);
+            return Ok(output.into());
         }
 
         let mut args: Vec<String> = vec![
@@ -5362,7 +5400,7 @@ impl Tool for GrepTool {
                 stable_cache_dependency_for_path(&search_path, cache_mode, cache_deps.as_deref()),
                 &output,
             );
-            return Ok(output);
+            return Ok(output.into());
         }
 
         let mut file_cache: HashMap<PathBuf, Vec<String>> = HashMap::new();
@@ -5522,7 +5560,7 @@ impl Tool for GrepTool {
             stable_cache_dependency_for_path(&search_path, cache_mode, cache_deps.as_deref()),
             &output,
         );
-        Ok(output)
+        Ok(output.into())
     }
 }
 
@@ -5603,7 +5641,7 @@ impl Tool for FindTool {
         tool_call_id: &str,
         input: serde_json::Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
-    ) -> Result<ToolOutput> {
+    ) -> Result<ToolExecution> {
         let input_value = input.clone();
         let input: FindInput =
             serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
@@ -5637,7 +5675,7 @@ impl Tool for FindTool {
         };
         let cache_deps = cache_dependency_for_path(&search_path, cache_mode);
         if let Some(output) = cached_tool_output(&cache_key, cache_deps.as_deref()) {
-            return Ok(output);
+            return Ok(output.into());
         }
 
         let fd_cmd = find_fd_binary().ok_or_else(|| {
@@ -5788,7 +5826,7 @@ impl Tool for FindTool {
                 stable_cache_dependency_for_path(&search_path, cache_mode, cache_deps.as_deref()),
                 &output,
             );
-            return Ok(output);
+            return Ok(output.into());
         }
 
         let mut entries: Vec<FindEntry> = Vec::new();
@@ -5853,7 +5891,7 @@ impl Tool for FindTool {
                 stable_cache_dependency_for_path(&search_path, cache_mode, cache_deps.as_deref()),
                 &output,
             );
-            return Ok(output);
+            return Ok(output.into());
         }
 
         let result_limit_reached = entries.len() > effective_limit;
@@ -5920,7 +5958,7 @@ impl Tool for FindTool {
             stable_cache_dependency_for_path(&search_path, cache_mode, cache_deps.as_deref()),
             &output,
         );
-        Ok(output)
+        Ok(output.into())
     }
 }
 
@@ -5996,7 +6034,7 @@ impl Tool for LsTool {
         tool_call_id: &str,
         input: serde_json::Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
-    ) -> Result<ToolOutput> {
+    ) -> Result<ToolExecution> {
         let input_value = input.clone();
         let input: LsInput =
             serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
@@ -6032,7 +6070,7 @@ impl Tool for LsTool {
         let cache_mode = ToolCacheFingerprintMode::DirectoryImmediate;
         let cache_deps = cache_dependency_for_path(&dir_path, cache_mode);
         if let Some(output) = cached_tool_output(&cache_key, cache_deps.as_deref()) {
-            return Ok(output);
+            return Ok(output.into());
         }
 
         let mut entries = Vec::new();
@@ -6099,7 +6137,7 @@ impl Tool for LsTool {
                 stable_cache_dependency_for_path(&dir_path, cache_mode, cache_deps.as_deref()),
                 &output,
             );
-            return Ok(output);
+            return Ok(output.into());
         }
 
         // Apply byte truncation while writing, avoiding a second joined copy.
@@ -6165,7 +6203,7 @@ impl Tool for LsTool {
             stable_cache_dependency_for_path(&dir_path, cache_mode, cache_deps.as_deref()),
             &output,
         );
-        Ok(output)
+        Ok(output.into())
     }
 }
 
@@ -7379,7 +7417,7 @@ impl Tool for HashlineEditTool {
         _tool_call_id: &str,
         input: serde_json::Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
-    ) -> Result<ToolOutput> {
+    ) -> Result<ToolExecution> {
         let input: HashlineEditInput = serde_json::from_value(input)
             .map_err(|e| Error::tool("hashline_edit", format!("Invalid input: {e}")))?;
 
@@ -7726,7 +7764,7 @@ impl Tool for HashlineEditTool {
             )))],
             details: Some(serde_json::Value::Object(details)),
             is_error: false,
-        })
+        }.into())
     }
 }
 
@@ -8834,14 +8872,13 @@ mod tests {
             std::fs::write(tmp.path().join("hello.txt"), "alpha\nbeta\ngamma").unwrap();
 
             let tool = ReadTool::new(tmp.path());
-            let out = tool
+            let out = match tool
                 .execute(
                     "t",
                     serde_json::json!({ "path": tmp.path().join("hello.txt").to_string_lossy() }),
                     None,
                 )
-                .await
-                .unwrap();
+                .await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
             let text = get_text(&out.content);
             assert!(text.contains("alpha"));
             assert!(text.contains("beta"));
@@ -8959,14 +8996,13 @@ mod tests {
             std::fs::write(tmp.path().join("empty.txt"), "").unwrap();
 
             let tool = ReadTool::new(tmp.path());
-            let out = tool
+            let out = match tool
                 .execute(
                     "t",
                     serde_json::json!({ "path": tmp.path().join("empty.txt").to_string_lossy() }),
                     None,
                 )
-                .await
-                .unwrap();
+                .await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
             let text = get_text(&out.content);
             assert_eq!(text, "");
             assert!(!out.is_error);
@@ -9033,7 +9069,7 @@ mod tests {
             .unwrap();
 
             let tool = ReadTool::new(tmp.path());
-            let out = tool
+            let out = match tool
                 .execute(
                     "t",
                     serde_json::json!({
@@ -9043,8 +9079,7 @@ mod tests {
                     }),
                     None,
                 )
-                .await
-                .unwrap();
+                .await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
             let text = get_text(&out.content);
             assert!(text.contains("L3"));
             assert!(text.contains("L4"));
@@ -9060,7 +9095,7 @@ mod tests {
             std::fs::write(tmp.path().join("lines.txt"), b"L1\rL2\rL3\r").unwrap();
 
             let tool = ReadTool::new(tmp.path());
-            let out = tool
+            let out = match tool
                 .execute(
                     "t",
                     serde_json::json!({
@@ -9070,8 +9105,7 @@ mod tests {
                     }),
                     None,
                 )
-                .await
-                .unwrap();
+                .await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
             let text = get_text(&out.content);
             assert!(text.contains("L2"));
             assert!(!text.contains("L1"));
@@ -9090,7 +9124,7 @@ mod tests {
             std::fs::write(tmp.path().join("lines.txt"), content).unwrap();
 
             let tool = ReadTool::new(tmp.path());
-            let out = tool
+            let out = match tool
                 .execute(
                     "t",
                     serde_json::json!({
@@ -9100,8 +9134,7 @@ mod tests {
                     }),
                     None,
                 )
-                .await
-                .unwrap();
+                .await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
             let text = get_text(&out.content);
             assert!(text.contains("SECOND"));
             assert!(!text.contains("THIRD"));
@@ -9167,14 +9200,13 @@ mod tests {
             std::fs::write(tmp.path().join("binary.bin"), &binary_data).unwrap();
 
             let tool = ReadTool::new(tmp.path());
-            let out = tool
+            let out = match tool
                 .execute(
                     "t",
                     serde_json::json!({ "path": tmp.path().join("binary.bin").to_string_lossy() }),
                     None,
                 )
-                .await
-                .unwrap();
+                .await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
             // Binary files are read as lossy UTF-8 with replacement characters
             let text = get_text(&out.content);
             assert!(!text.is_empty());
@@ -9202,14 +9234,13 @@ mod tests {
             std::fs::write(tmp.path().join("test.png"), &png_header).unwrap();
 
             let tool = ReadTool::new(tmp.path());
-            let out = tool
+            let out = match tool
                 .execute(
                     "t",
                     serde_json::json!({ "path": tmp.path().join("test.png").to_string_lossy() }),
                     None,
                 )
-                .await
-                .unwrap();
+                .await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
 
             // Should return an image content block
             let has_image = out
@@ -9263,14 +9294,13 @@ mod tests {
             std::fs::write(&image_path, &png_bytes).unwrap();
 
             let tool = ReadTool::new(tmp.path());
-            let out = tool
+            let out = match tool
                 .execute(
                     "t",
                     serde_json::json!({ "path": image_path.to_string_lossy() }),
                     None,
                 )
-                .await
-                .unwrap();
+                .await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
 
             assert!(!out.is_error, "resizable large images should succeed");
             assert!(
@@ -9321,14 +9351,13 @@ mod tests {
             std::fs::write(tmp.path().join("big.txt"), &content).unwrap();
 
             let tool = ReadTool::new(tmp.path());
-            let out = tool
+            let out = match tool
                 .execute(
                     "t",
                     serde_json::json!({ "path": tmp.path().join("big.txt").to_string_lossy() }),
                     None,
                 )
-                .await
-                .unwrap();
+                .await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
             // Should have truncation details
             assert!(out.details.is_some(), "expected truncation details");
             let text = get_text(&out.content);
@@ -9344,14 +9373,13 @@ mod tests {
             std::fs::write(tmp.path().join("too_long.txt"), long_line).unwrap();
 
             let tool = ReadTool::new(tmp.path());
-            let out = tool
+            let out = match tool
                 .execute(
                     "t",
                     serde_json::json!({ "path": tmp.path().join("too_long.txt").to_string_lossy() }),
                     None,
                 )
-                .await
-                .unwrap();
+                .await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
 
             let text = get_text(&out.content);
             let expected_limit = format!("exceeds {} limit", format_size(DEFAULT_MAX_BYTES));
@@ -9377,14 +9405,13 @@ mod tests {
             std::fs::write(tmp.path().join("uni.txt"), "Hello 你好 🌍\nLine 2 café").unwrap();
 
             let tool = ReadTool::new(tmp.path());
-            let out = tool
+            let out = match tool
                 .execute(
                     "t",
                     serde_json::json!({ "path": tmp.path().join("uni.txt").to_string_lossy() }),
                     None,
                 )
-                .await
-                .unwrap();
+                .await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
             let text = get_text(&out.content);
             assert!(text.contains("你好"));
             assert!(text.contains("🌍"));
@@ -9401,7 +9428,7 @@ mod tests {
         asupersync::test_utils::run_test(|| async {
             let tmp = tempfile::tempdir().unwrap();
             let tool = WriteTool::new(tmp.path());
-            let out = tool
+            let out = match tool
                 .execute(
                     "t",
                     serde_json::json!({
@@ -9410,8 +9437,7 @@ mod tests {
                     }),
                     None,
                 )
-                .await
-                .unwrap();
+                .await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
             assert!(!out.is_error);
             let contents = std::fs::read_to_string(tmp.path().join("new.txt")).unwrap();
             assert_eq!(contents, "hello world");
@@ -9425,7 +9451,7 @@ mod tests {
             std::fs::write(tmp.path().join("exist.txt"), "old content").unwrap();
 
             let tool = WriteTool::new(tmp.path());
-            let out = tool
+            let out = match tool
                 .execute(
                     "t",
                     serde_json::json!({
@@ -9434,8 +9460,7 @@ mod tests {
                     }),
                     None,
                 )
-                .await
-                .unwrap();
+                .await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
             assert!(!out.is_error);
             let contents = std::fs::read_to_string(tmp.path().join("exist.txt")).unwrap();
             assert_eq!(contents, "new content");
@@ -9448,7 +9473,7 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             let tool = WriteTool::new(tmp.path());
             let deep_path = tmp.path().join("a/b/c/deep.txt");
-            let out = tool
+            let out = match tool
                 .execute(
                     "t",
                     serde_json::json!({
@@ -9457,8 +9482,7 @@ mod tests {
                     }),
                     None,
                 )
-                .await
-                .unwrap();
+                .await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
             assert!(!out.is_error);
             assert!(deep_path.exists());
             assert_eq!(std::fs::read_to_string(&deep_path).unwrap(), "deep file");
@@ -9470,7 +9494,7 @@ mod tests {
         asupersync::test_utils::run_test(|| async {
             let tmp = tempfile::tempdir().unwrap();
             let tool = WriteTool::new(tmp.path());
-            let out = tool
+            let out = match tool
                 .execute(
                     "t",
                     serde_json::json!({
@@ -9479,8 +9503,7 @@ mod tests {
                     }),
                     None,
                 )
-                .await
-                .unwrap();
+                .await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
             assert!(!out.is_error);
             let contents = std::fs::read_to_string(tmp.path().join("empty.txt")).unwrap();
             assert_eq!(contents, "");
@@ -9528,7 +9551,7 @@ mod tests {
         asupersync::test_utils::run_test(|| async {
             let tmp = tempfile::tempdir().unwrap();
             let tool = WriteTool::new(tmp.path());
-            let out = tool
+            let out = match tool
                 .execute(
                     "t",
                     serde_json::json!({
@@ -9537,8 +9560,7 @@ mod tests {
                     }),
                     None,
                 )
-                .await
-                .unwrap();
+                .await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
             assert!(!out.is_error);
             let contents = std::fs::read_to_string(tmp.path().join("unicode.txt")).unwrap();
             assert_eq!(contents, "日本語 🎉 Ñoño");
@@ -9553,7 +9575,7 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             let tool = WriteTool::new(tmp.path());
             let path = tmp.path().join("perms.txt");
-            let out = tool
+            let out = match tool
                 .execute(
                     "t",
                     serde_json::json!({
@@ -9562,8 +9584,7 @@ mod tests {
                     }),
                     None,
                 )
-                .await
-                .unwrap();
+                .await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
             assert!(!out.is_error);
 
             let meta = std::fs::metadata(&path).unwrap();
@@ -9587,7 +9608,7 @@ mod tests {
             std::fs::write(tmp.path().join("code.rs"), "fn foo() { bar() }").unwrap();
 
             let tool = EditTool::new(tmp.path());
-            let out = tool
+            let out = match tool
                 .execute(
                     "t",
                     serde_json::json!({
@@ -9597,8 +9618,7 @@ mod tests {
                     }),
                     None,
                 )
-                .await
-                .unwrap();
+                .await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
             assert!(!out.is_error);
             let contents = std::fs::read_to_string(tmp.path().join("code.rs")).unwrap();
             assert_eq!(contents, "fn foo() { baz() }");
@@ -9691,7 +9711,7 @@ mod tests {
             .unwrap();
 
             let tool = EditTool::new(tmp.path());
-            let out = tool
+            let out = match tool
                 .execute(
                     "t",
                     serde_json::json!({
@@ -9701,8 +9721,7 @@ mod tests {
                     }),
                     None,
                 )
-                .await
-                .unwrap();
+                .await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
             assert!(!out.is_error);
             let contents = std::fs::read_to_string(tmp.path().join("multi.txt")).unwrap();
             assert_eq!(
@@ -9719,7 +9738,7 @@ mod tests {
             std::fs::write(tmp.path().join("uni.txt"), "Héllo wörld 🌍").unwrap();
 
             let tool = EditTool::new(tmp.path());
-            let out = tool
+            let out = match tool
                 .execute(
                     "t",
                     serde_json::json!({
@@ -9729,8 +9748,7 @@ mod tests {
                     }),
                     None,
                 )
-                .await
-                .unwrap();
+                .await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
             assert!(!out.is_error);
             let contents = std::fs::read_to_string(tmp.path().join("uni.txt")).unwrap();
             assert_eq!(contents, "Héllo Welt 🌎");
@@ -9794,14 +9812,13 @@ mod tests {
         asupersync::test_utils::run_test(|| async {
             let tmp = tempfile::tempdir().unwrap();
             let tool = BashTool::new(tmp.path());
-            let out = tool
+            let out = match tool
                 .execute(
                     "t",
                     serde_json::json!({ "command": "echo hello_from_bash" }),
                     None,
                 )
-                .await
-                .unwrap();
+                .await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
             let text = get_text(&out.content);
             assert!(text.contains("hello_from_bash"));
             assert!(!out.is_error);
@@ -9813,10 +9830,9 @@ mod tests {
         asupersync::test_utils::run_test(|| async {
             let tmp = tempfile::tempdir().unwrap();
             let tool = BashTool::new(tmp.path());
-            let out = tool
+            let out = match tool
                 .execute("t", serde_json::json!({ "command": "exit 42" }), None)
-                .await
-                .expect("non-zero exit should return Ok with is_error=true");
+                .await.expect("non-zero exit should return Ok with is_error=true") { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
             assert!(out.is_error, "non-zero exit must set is_error");
             let msg = get_text(&out.content);
             assert!(
@@ -9832,10 +9848,9 @@ mod tests {
         asupersync::test_utils::run_test(|| async {
             let tmp = tempfile::tempdir().unwrap();
             let tool = BashTool::new(tmp.path());
-            let out = tool
+            let out = match tool
                 .execute("t", serde_json::json!({ "command": "kill -KILL $$" }), None)
-                .await
-                .expect("signal-terminated shell should return Ok with is_error=true");
+                .await.expect("signal-terminated shell should return Ok with is_error=true") { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
             assert!(
                 out.is_error,
                 "signal-terminated shell must be reported as error"
@@ -9857,14 +9872,13 @@ mod tests {
         asupersync::test_utils::run_test(|| async {
             let tmp = tempfile::tempdir().unwrap();
             let tool = BashTool::new(tmp.path());
-            let out = tool
+            let out = match tool
                 .execute(
                     "t",
                     serde_json::json!({ "command": "echo stderr_msg >&2" }),
                     None,
                 )
-                .await
-                .unwrap();
+                .await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
             let text = get_text(&out.content);
             assert!(
                 text.contains("stderr_msg"),
@@ -9878,14 +9892,13 @@ mod tests {
         asupersync::test_utils::run_test(|| async {
             let tmp = tempfile::tempdir().unwrap();
             let tool = BashTool::new(tmp.path());
-            let out = tool
+            let out = match tool
                 .execute(
                     "t",
                     serde_json::json!({ "command": "sleep 60", "timeout": 2 }),
                     None,
                 )
-                .await
-                .expect("timeout should return Ok with is_error=true");
+                .await.expect("timeout should return Ok with is_error=true") { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
             assert!(out.is_error, "timeout must set is_error");
             let msg = get_text(&out.content);
             assert!(
@@ -9913,7 +9926,7 @@ mod tests {
             let marker = tmp.path().join("leaked_child.txt");
             let tool = BashTool::new(tmp.path());
 
-            let out = tool
+            let out = match tool
                 .execute(
                     "t",
                     serde_json::json!({
@@ -9922,8 +9935,7 @@ mod tests {
                     }),
                     None,
                 )
-                .await
-                .expect("timeout should return Ok with is_error=true");
+                .await.expect("timeout should return Ok with is_error=true") { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
 
             assert!(out.is_error, "timeout must set is_error");
             let msg = get_text(&out.content);
@@ -10181,10 +10193,9 @@ mod tests {
         asupersync::test_utils::run_test(|| async {
             let tmp = tempfile::tempdir().unwrap();
             let tool = BashTool::new(tmp.path());
-            let out = tool
+            let out = match tool
                 .execute("t", serde_json::json!({ "command": "pwd" }), None)
-                .await
-                .unwrap();
+                .await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
             let text = get_text(&out.content);
             let canonical = tmp.path().canonicalize().unwrap();
             assert!(
@@ -10199,14 +10210,13 @@ mod tests {
         asupersync::test_utils::run_test(|| async {
             let tmp = tempfile::tempdir().unwrap();
             let tool = BashTool::new(tmp.path());
-            let out = tool
+            let out = match tool
                 .execute(
                     "t",
                     serde_json::json!({ "command": "echo line1; echo line2; echo line3" }),
                     None,
                 )
-                .await
-                .unwrap();
+                .await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
             let text = get_text(&out.content);
             assert!(text.contains("line1"));
             assert!(text.contains("line2"));
@@ -10229,7 +10239,7 @@ mod tests {
             .unwrap();
 
             let tool = GrepTool::new(tmp.path());
-            let out = tool
+            let out = match tool
                 .execute(
                     "t",
                     serde_json::json!({
@@ -10238,8 +10248,7 @@ mod tests {
                     }),
                     None,
                 )
-                .await
-                .unwrap();
+                .await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
             let text = get_text(&out.content);
             assert!(text.contains("apple"));
             assert!(text.contains("apricot"));
@@ -10333,7 +10342,7 @@ mod tests {
             .unwrap();
 
             let tool = GrepTool::new(tmp.path());
-            let out = tool
+            let out = match tool
                 .execute(
                     "t",
                     serde_json::json!({
@@ -10342,8 +10351,7 @@ mod tests {
                     }),
                     None,
                 )
-                .await
-                .unwrap();
+                .await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
             let text = get_text(&out.content);
             assert!(text.contains("foo123"));
             assert!(text.contains("foo000"));
@@ -10358,7 +10366,7 @@ mod tests {
             std::fs::write(tmp.path().join("case.txt"), "Hello\nhello\nHELLO").unwrap();
 
             let tool = GrepTool::new(tmp.path());
-            let out = tool
+            let out = match tool
                 .execute(
                     "t",
                     serde_json::json!({
@@ -10368,8 +10376,7 @@ mod tests {
                     }),
                     None,
                 )
-                .await
-                .unwrap();
+                .await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
             let text = get_text(&out.content);
             assert!(text.contains("Hello"));
             assert!(text.contains("hello"));
@@ -10384,7 +10391,7 @@ mod tests {
             std::fs::write(tmp.path().join("case_sensitive.txt"), "Hello\nHELLO").unwrap();
 
             let tool = GrepTool::new(tmp.path());
-            let out = tool
+            let out = match tool
                 .execute(
                     "t",
                     serde_json::json!({
@@ -10393,8 +10400,7 @@ mod tests {
                     }),
                     None,
                 )
-                .await
-                .unwrap();
+                .await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
             let text = get_text(&out.content);
             assert!(
                 text.contains("No matches found"),
@@ -10411,7 +10417,7 @@ mod tests {
             std::fs::write(&file, "needle one\nskip\nneedle two\n").unwrap();
 
             let tool = GrepTool::new(tmp.path());
-            let base_out = tool
+            let base_out = match tool
                 .execute(
                     "t",
                     serde_json::json!({
@@ -10421,12 +10427,11 @@ mod tests {
                     }),
                     None,
                 )
-                .await
-                .unwrap();
+                .await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
             let base_text = get_text(&base_out.content);
 
             std::fs::write(&file, "needle one\nskip\nneedle two\nalpha\nbeta\n").unwrap();
-            let extended_out = tool
+            let extended_out = match tool
                 .execute(
                     "t",
                     serde_json::json!({
@@ -10436,8 +10441,7 @@ mod tests {
                     }),
                     None,
                 )
-                .await
-                .unwrap();
+                .await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
             let extended_text = get_text(&extended_out.content);
 
             assert_eq!(
@@ -10454,7 +10458,7 @@ mod tests {
             std::fs::write(tmp.path().join("nothing.txt"), "alpha\nbeta\ngamma").unwrap();
 
             let tool = GrepTool::new(tmp.path());
-            let out = tool
+            let out = match tool
                 .execute(
                     "t",
                     serde_json::json!({
@@ -10463,8 +10467,7 @@ mod tests {
                     }),
                     None,
                 )
-                .await
-                .unwrap();
+                .await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
             let text = get_text(&out.content);
             assert!(
                 text.to_lowercase().contains("no match")
@@ -10486,7 +10489,7 @@ mod tests {
             .unwrap();
 
             let tool = GrepTool::new(tmp.path());
-            let out = tool
+            let out = match tool
                 .execute(
                     "t",
                     serde_json::json!({
@@ -10496,8 +10499,7 @@ mod tests {
                     }),
                     None,
                 )
-                .await
-                .unwrap();
+                .await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
             let text = get_text(&out.content);
             assert!(text.contains("target"));
             assert!(text.contains("ccc"), "expected context line before match");
@@ -10516,7 +10518,7 @@ mod tests {
             std::fs::write(tmp.path().join("many.txt"), &content).unwrap();
 
             let tool = GrepTool::new(tmp.path());
-            let out = tool
+            let out = match tool
                 .execute(
                     "t",
                     serde_json::json!({
@@ -10526,8 +10528,7 @@ mod tests {
                     }),
                     None,
                 )
-                .await
-                .unwrap();
+                .await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
             let text = get_text(&out.content);
             // With limit=5, we should see at most 5 matches
             let match_count = text.matches("match_line_").count();
@@ -10556,7 +10557,7 @@ mod tests {
             std::fs::write(tmp.path().join("exact.txt"), &content).unwrap();
 
             let tool = GrepTool::new(tmp.path());
-            let out = tool
+            let out = match tool
                 .execute(
                     "t",
                     serde_json::json!({
@@ -10566,8 +10567,7 @@ mod tests {
                     }),
                     None,
                 )
-                .await
-                .unwrap();
+                .await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
 
             let text = get_text(&out.content);
             assert_eq!(text.matches("match_line_").count(), 5);
@@ -10609,14 +10609,18 @@ mod tests {
                 None,
             );
 
-            let out = asupersync::time::timeout(
+            let out = match asupersync::time::timeout(
                 asupersync::time::wall_now(),
                 Duration::from_secs(15),
                 Box::pin(run),
             )
             .await
             .expect("grep timed out; possible stdout/stderr reader deadlock")
-            .expect("grep should succeed");
+            .expect("grep should succeed")
+            {
+                ToolExecution::Done(o) => o,
+                _ => panic!("expected Done"),
+            };
 
             let text = get_text(&out.content);
             assert!(text.contains("needle_line_0"));
@@ -10632,10 +10636,9 @@ mod tests {
             std::fs::write(tmp.path().join("visible.txt"), "nothing here").unwrap();
 
             let tool = GrepTool::new(tmp.path());
-            let out = tool
+            let out = match tool
                 .execute("t", serde_json::json!({ "pattern": "needle" }), None)
-                .await
-                .unwrap();
+                .await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
 
             let text = get_text(&out.content);
             assert!(
@@ -10652,7 +10655,7 @@ mod tests {
             std::fs::write(tmp.path().join("literal.txt"), "a+b\na.b\nab\na\\+b").unwrap();
 
             let tool = GrepTool::new(tmp.path());
-            let out = tool
+            let out = match tool
                 .execute(
                     "t",
                     serde_json::json!({
@@ -10662,8 +10665,7 @@ mod tests {
                     }),
                     None,
                 )
-                .await
-                .unwrap();
+                .await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
             let text = get_text(&out.content);
             assert!(text.contains("a+b"), "literal match should find 'a+b'");
         });
@@ -10680,7 +10682,7 @@ mod tests {
             .unwrap();
 
             let tool = GrepTool::new(tmp.path());
-            let out = tool
+            let out = match tool
                 .execute(
                     "t",
                     serde_json::json!({
@@ -10690,8 +10692,7 @@ mod tests {
                     }),
                     None,
                 )
-                .await
-                .unwrap();
+                .await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
             let text = get_text(&out.content);
             // Hashline output should contain N#AB tags instead of bare line numbers
             // Line 1 (apple) and line 3 (apricot) should match
@@ -10721,7 +10722,7 @@ mod tests {
             .unwrap();
 
             let tool = GrepTool::new(tmp.path());
-            let out = tool
+            let out = match tool
                 .execute(
                     "t",
                     serde_json::json!({
@@ -10732,8 +10733,7 @@ mod tests {
                     }),
                     None,
                 )
-                .await
-                .unwrap();
+                .await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
             let text = get_text(&out.content);
             // With context=1, should include line2, target, line4
             assert!(text.contains("line2"), "should contain context line2");
@@ -10769,7 +10769,7 @@ mod tests {
             std::fs::write(tmp.path().join("file3.txt"), "").unwrap();
 
             let tool = FindTool::new(tmp.path());
-            let out = tool
+            let out = match tool
                 .execute(
                     "t",
                     serde_json::json!({
@@ -10778,8 +10778,7 @@ mod tests {
                     }),
                     None,
                 )
-                .await
-                .unwrap();
+                .await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
             let text = get_text(&out.content);
             assert!(text.contains("file1.rs"));
             assert!(text.contains("file2.rs"));
@@ -10797,7 +10796,7 @@ mod tests {
             std::fs::write(tmp.path().join("match.txt"), "a").unwrap();
 
             let tool = FindTool::new(tmp.path());
-            let base_out = tool
+            let base_out = match tool
                 .execute(
                     "t",
                     serde_json::json!({
@@ -10806,12 +10805,11 @@ mod tests {
                     }),
                     None,
                 )
-                .await
-                .unwrap();
+                .await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
             let base_text = get_text(&base_out.content);
 
             std::fs::write(tmp.path().join("ignore.md"), "b").unwrap();
-            let extended_out = tool
+            let extended_out = match tool
                 .execute(
                     "t",
                     serde_json::json!({
@@ -10820,8 +10818,7 @@ mod tests {
                     }),
                     None,
                 )
-                .await
-                .unwrap();
+                .await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
             let extended_text = get_text(&extended_out.content);
 
             assert_eq!(
@@ -10866,7 +10863,7 @@ mod tests {
             }
 
             let tool = FindTool::new(tmp.path());
-            let out = tool
+            let out = match tool
                 .execute(
                     "t",
                     serde_json::json!({
@@ -10876,8 +10873,7 @@ mod tests {
                     }),
                     None,
                 )
-                .await
-                .unwrap();
+                .await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
             let text = get_text(&out.content);
             let file_count = text.lines().filter(|l| l.contains(".txt")).count();
             assert!(
@@ -10906,7 +10902,7 @@ mod tests {
             }
 
             let tool = FindTool::new(tmp.path());
-            let out = tool
+            let out = match tool
                 .execute(
                     "t",
                     serde_json::json!({
@@ -10916,8 +10912,7 @@ mod tests {
                     }),
                     None,
                 )
-                .await
-                .unwrap();
+                .await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
 
             let text = get_text(&out.content);
             assert_eq!(text.lines().filter(|line| line.contains(".txt")).count(), 5);
@@ -10975,7 +10970,7 @@ mod tests {
             std::fs::write(tmp.path().join("only.txt"), "").unwrap();
 
             let tool = FindTool::new(tmp.path());
-            let out = tool
+            let out = match tool
                 .execute(
                     "t",
                     serde_json::json!({
@@ -10984,8 +10979,7 @@ mod tests {
                     }),
                     None,
                 )
-                .await
-                .unwrap();
+                .await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
             let text = get_text(&out.content);
             assert!(
                 text.to_lowercase().contains("no files found")
@@ -11031,7 +11025,7 @@ mod tests {
             std::fs::write(tmp.path().join("a/b/c/deep.rs"), "").unwrap();
 
             let tool = FindTool::new(tmp.path());
-            let out = tool
+            let out = match tool
                 .execute(
                     "t",
                     serde_json::json!({
@@ -11040,8 +11034,7 @@ mod tests {
                     }),
                     None,
                 )
-                .await
-                .unwrap();
+                .await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
             let text = get_text(&out.content);
             assert!(text.contains("top.rs"));
             assert!(text.contains("mid.rs"));
@@ -11068,7 +11061,7 @@ mod tests {
             std::fs::write(tmp.path().join("newest.txt"), "").unwrap();
 
             let tool = FindTool::new(tmp.path());
-            let out = tool
+            let out = match tool
                 .execute(
                     "t",
                     serde_json::json!({
@@ -11077,8 +11070,7 @@ mod tests {
                     }),
                     None,
                 )
-                .await
-                .unwrap();
+                .await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
             let lines: Vec<String> = get_text(&out.content)
                 .lines()
                 .map(str::trim)
@@ -11106,7 +11098,7 @@ mod tests {
             std::fs::write(tmp.path().join("ignored.txt"), "").unwrap();
 
             let tool = FindTool::new(tmp.path());
-            let out = tool
+            let out = match tool
                 .execute(
                     "t",
                     serde_json::json!({
@@ -11115,8 +11107,7 @@ mod tests {
                     }),
                     None,
                 )
-                .await
-                .unwrap();
+                .await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
             let text = get_text(&out.content);
             assert!(
                 text.contains("No files found matching pattern"),
@@ -11138,14 +11129,13 @@ mod tests {
             std::fs::create_dir(tmp.path().join("subdir")).unwrap();
 
             let tool = LsTool::new(tmp.path());
-            let out = tool
+            let out = match tool
                 .execute(
                     "t",
                     serde_json::json!({ "path": tmp.path().to_string_lossy() }),
                     None,
                 )
-                .await
-                .unwrap();
+                .await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
             let text = get_text(&out.content);
             assert!(text.contains("file_a.txt"));
             assert!(text.contains("file_b.rs"));
@@ -11181,14 +11171,13 @@ mod tests {
             std::fs::create_dir(tmp.path().join("mydir")).unwrap();
 
             let tool = LsTool::new(tmp.path());
-            let out = tool
+            let out = match tool
                 .execute(
                     "t",
                     serde_json::json!({ "path": tmp.path().to_string_lossy() }),
                     None,
                 )
-                .await
-                .unwrap();
+                .await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
             let text = get_text(&out.content);
             assert!(
                 text.contains("mydir/"),
@@ -11206,7 +11195,7 @@ mod tests {
             }
 
             let tool = LsTool::new(tmp.path());
-            let out = tool
+            let out = match tool
                 .execute(
                     "t",
                     serde_json::json!({
@@ -11215,8 +11204,7 @@ mod tests {
                     }),
                     None,
                 )
-                .await
-                .unwrap();
+                .await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
             let text = get_text(&out.content);
             let entry_count = text.lines().filter(|l| l.contains("item_")).count();
             assert!(
@@ -11283,14 +11271,13 @@ mod tests {
             std::fs::create_dir(&empty_dir).unwrap();
 
             let tool = LsTool::new(tmp.path());
-            let out = tool
+            let out = match tool
                 .execute(
                     "t",
                     serde_json::json!({ "path": empty_dir.to_string_lossy() }),
                     None,
                 )
-                .await
-                .unwrap();
+                .await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
             assert!(!out.is_error);
         });
     }
@@ -11302,10 +11289,9 @@ mod tests {
             std::fs::write(tmp.path().join("in_cwd.txt"), "").unwrap();
 
             let tool = LsTool::new(tmp.path());
-            let out = tool
+            let out = match tool
                 .execute("t", serde_json::json!({}), None)
-                .await
-                .unwrap();
+                .await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
             let text = get_text(&out.content);
             assert!(
                 text.contains("in_cwd.txt"),
@@ -12061,7 +12047,7 @@ mod tests {
             // Original "line2" is at index 7. Normalized "line2" is at index 6.
             // If we used original index (7) on normalized string ("line1\nline2\nline3"),
             // we would start at "ine2..." instead of "line2...", corrupting the file.
-            let out = tool
+            let out = match tool
                 .execute(
                     "t",
                     serde_json::json!({
@@ -12071,8 +12057,7 @@ mod tests {
                     }),
                     None,
                 )
-                .await
-                .unwrap();
+                .await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
 
             assert!(!out.is_error);
             let new_content = std::fs::read_to_string(&path).unwrap();
@@ -12090,7 +12075,7 @@ mod tests {
             std::fs::write(&path, "line1\rline2\rline3").unwrap();
 
             let tool = EditTool::new(tmp.path());
-            let out = tool
+            let out = match tool
                 .execute(
                     "t",
                     serde_json::json!({
@@ -12100,8 +12085,7 @@ mod tests {
                     }),
                     None,
                 )
-                .await
-                .unwrap();
+                .await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
 
             assert!(!out.is_error);
             let new_content = std::fs::read_to_string(&path).unwrap();
@@ -12238,7 +12222,7 @@ mod tests {
                 }]
             });
 
-            let out = tool.execute("test", input, None).await.unwrap();
+            let out = match tool.execute("test", input, None).await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
             assert!(!out.is_error);
 
             let content = std::fs::read_to_string(&file).unwrap();
@@ -12268,7 +12252,7 @@ mod tests {
                 }]
             });
 
-            let out = tool.execute("test", input, None).await.unwrap();
+            let out = match tool.execute("test", input, None).await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
             assert!(!out.is_error);
 
             let content = std::fs::read_to_string(&file).unwrap();
@@ -12295,7 +12279,7 @@ mod tests {
                 }]
             });
 
-            let out = tool.execute("test", input, None).await.unwrap();
+            let out = match tool.execute("test", input, None).await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
             assert!(!out.is_error);
 
             let content = std::fs::read_to_string(&file).unwrap();
@@ -12322,7 +12306,7 @@ mod tests {
                 }]
             });
 
-            let out = tool.execute("test", input, None).await.unwrap();
+            let out = match tool.execute("test", input, None).await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
             assert!(!out.is_error);
 
             let content = std::fs::read_to_string(&file).unwrap();
@@ -12350,7 +12334,7 @@ mod tests {
                 ]
             });
 
-            let out = tool.execute("test", input, None).await.unwrap();
+            let out = match tool.execute("test", input, None).await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
             assert!(!out.is_error);
 
             let content = std::fs::read_to_string(&file).unwrap();
@@ -12406,7 +12390,7 @@ mod tests {
                 ]
             });
 
-            let out = tool.execute("test", input, None).await.unwrap();
+            let out = match tool.execute("test", input, None).await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
             assert!(!out.is_error);
 
             let content = std::fs::read_to_string(&file).unwrap();
@@ -12457,7 +12441,7 @@ mod tests {
                 "hashline": true
             });
 
-            let out = tool.execute("test", input, None).await.unwrap();
+            let out = match tool.execute("test", input, None).await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
             assert!(!out.is_error);
             let text = get_text(&out.content);
 
@@ -12502,7 +12486,7 @@ mod tests {
                 }]
             });
 
-            let out = tool.execute("test", input, None).await.unwrap();
+            let out = match tool.execute("test", input, None).await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
             assert!(!out.is_error);
 
             let content = std::fs::read_to_string(&file).unwrap();
@@ -12532,7 +12516,7 @@ mod tests {
                 }]
             });
 
-            let out = tool.execute("test", input, None).await.unwrap();
+            let out = match tool.execute("test", input, None).await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
             assert!(!out.is_error);
 
             let content = std::fs::read_to_string(&file).unwrap();
@@ -12559,7 +12543,7 @@ mod tests {
                 }]
             });
 
-            let out = tool.execute("test", input, None).await.unwrap();
+            let out = match tool.execute("test", input, None).await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
             assert!(!out.is_error);
 
             let content = std::fs::read_to_string(&file).unwrap();
@@ -12586,7 +12570,7 @@ mod tests {
                 }]
             });
 
-            let out = tool.execute("test", input, None).await.unwrap();
+            let out = match tool.execute("test", input, None).await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
             assert!(!out.is_error);
 
             let content = std::fs::read_to_string(&file).unwrap();
@@ -12612,7 +12596,7 @@ mod tests {
                 }]
             });
 
-            let out = tool.execute("test", input, None).await.unwrap();
+            let out = match tool.execute("test", input, None).await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
             assert!(!out.is_error);
 
             let content = std::fs::read_to_string(&file).unwrap();
@@ -12639,7 +12623,7 @@ mod tests {
                 }]
             });
 
-            let out = tool.execute("test", input, None).await.unwrap();
+            let out = match tool.execute("test", input, None).await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
             assert!(!out.is_error);
 
             let content = std::fs::read_to_string(&file).unwrap();
@@ -12667,7 +12651,7 @@ mod tests {
                 }]
             });
 
-            let out = tool.execute("test", input, None).await.unwrap();
+            let out = match tool.execute("test", input, None).await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
             assert!(!out.is_error);
 
             let content = std::fs::read_to_string(&file).unwrap();
@@ -12693,7 +12677,7 @@ mod tests {
                 }]
             });
 
-            let out = tool.execute("test", input, None).await.unwrap();
+            let out = match tool.execute("test", input, None).await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
             assert!(!out.is_error);
 
             let content = std::fs::read_to_string(&file).unwrap();
@@ -12719,7 +12703,7 @@ mod tests {
                 }]
             });
 
-            let out = tool.execute("test", input, None).await.unwrap();
+            let out = match tool.execute("test", input, None).await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
             assert!(!out.is_error);
 
             let content = std::fs::read_to_string(&file).unwrap();
@@ -12815,7 +12799,7 @@ mod tests {
                 }]
             });
 
-            let out = tool.execute("test", input, None).await.unwrap();
+            let out = match tool.execute("test", input, None).await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
             assert!(!out.is_error);
 
             let content = std::fs::read_to_string(&file).unwrap();

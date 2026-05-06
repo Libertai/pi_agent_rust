@@ -15489,13 +15489,14 @@ mod wasm_host {
                 _tool_call_id: &str,
                 _input: Value,
                 _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
-            ) -> Result<ToolOutput> {
+            ) -> Result<crate::tools::ToolExecution> {
                 sleep(wall_now(), Duration::from_millis(200)).await;
                 Ok(ToolOutput {
                     content: vec![],
                     details: None,
                     is_error: false,
-                })
+                }
+                .into())
             }
         }
 
