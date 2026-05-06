@@ -1651,6 +1651,7 @@ mod tests {
                     details: None,
                     is_error: false,
                     timestamp: 2,
+                    paused: None,
                 }),
             ],
             vec![ToolDef {

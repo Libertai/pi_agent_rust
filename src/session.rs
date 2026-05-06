@@ -2868,6 +2868,45 @@ impl Session {
         }
     }
 
+    /// Drop earlier `ToolResult` entries when a later one with the same
+    /// `tool_call_id` is present. The session JSONL is append-only, so
+    /// resuming a paused tool re-appends a fresh result rather than
+    /// editing the sentinel in place. Loaders flatten by keeping the
+    /// latest occurrence per id; non-tool-result messages are
+    /// untouched.
+    fn dedupe_tool_results_keep_last(messages: Vec<Message>) -> Vec<Message> {
+        if messages.is_empty() {
+            return messages;
+        }
+        let mut last_index_by_id: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let mut has_dup = false;
+        for (idx, msg) in messages.iter().enumerate() {
+            if let Message::ToolResult(tr) = msg {
+                if let Some(prev) = last_index_by_id.insert(tr.tool_call_id.clone(), idx) {
+                    let _ = prev;
+                    has_dup = true;
+                }
+            }
+        }
+        if !has_dup {
+            return messages;
+        }
+        let mut out = Vec::with_capacity(messages.len());
+        for (idx, msg) in messages.into_iter().enumerate() {
+            if let Message::ToolResult(ref tr) = msg {
+                if last_index_by_id
+                    .get(&tr.tool_call_id)
+                    .is_some_and(|&keep| keep != idx)
+                {
+                    continue;
+                }
+            }
+            out.push(msg);
+        }
+        out
+    }
+
     fn to_messages_from_path<'a, F>(path_len: usize, entry_at: F) -> Vec<Message>
     where
         F: Fn(usize) -> &'a SessionEntry,
@@ -2926,14 +2965,14 @@ impl Session {
                 Self::append_model_message_for_entry(&mut messages, entry);
             }
 
-            return messages;
+            return Self::dedupe_tool_results_keep_last(messages);
         }
 
         let mut messages = Vec::with_capacity(path_len);
         for idx in 0..path_len {
             Self::append_model_message_for_entry(&mut messages, entry_at(idx));
         }
-        messages
+        Self::dedupe_tool_results_keep_last(messages)
     }
 
     /// Find the nearest ancestor that is a fork point (has multiple children)
@@ -3649,6 +3688,10 @@ pub enum SessionMessage {
         is_error: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         timestamp: Option<i64>,
+        /// When `Some`, this entry is a *sentinel* placeholder for a paused tool. Old session
+        /// files without this field deserialize as `None`.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        paused: Option<crate::model::PausedToolResult>,
     },
     Custom {
         custom_type: String,
@@ -3704,6 +3747,7 @@ impl From<Message> for SessionMessage {
                     details: result.details,
                     is_error: result.is_error,
                     timestamp: Some(result.timestamp),
+                    paused: result.paused,
                 }
             }
             Message::Custom(custom) => Self::Custom {
@@ -3835,6 +3879,7 @@ pub(crate) fn session_message_to_model(message: &SessionMessage) -> Option<Messa
             details,
             is_error,
             timestamp,
+            paused,
         } => Some(Message::tool_result(ToolResultMessage {
             tool_call_id: tool_call_id.clone(),
             tool_name: tool_name.clone(),
@@ -3842,6 +3887,7 @@ pub(crate) fn session_message_to_model(message: &SessionMessage) -> Option<Messa
             details: details.clone(),
             is_error: *is_error,
             timestamp: timestamp.unwrap_or_else(|| chrono::Utc::now().timestamp_millis()),
+            paused: paused.clone(),
         })),
         SessionMessage::Custom {
             custom_type,
@@ -6620,6 +6666,7 @@ mod tests {
             details: None,
             is_error: false,
             timestamp: Some(1000),
+            paused: None,
         };
         let tool_id = session.append_message(tool_msg);
 
@@ -6645,6 +6692,7 @@ mod tests {
             details: None,
             is_error: true,
             timestamp: Some(2000),
+            paused: None,
         };
         let tool_id = session.append_message(tool_msg);
 
@@ -6938,6 +6986,7 @@ mod tests {
             details: None,
             is_error: false,
             timestamp: Some(100),
+            paused: None,
         });
 
         session.append_bash_execution("ls".to_string(), "files".to_string(), 0, false, false, None);
@@ -7651,6 +7700,7 @@ mod tests {
             details: None,
             is_error: false,
             timestamp: Some(0),
+            paused: None,
         });
 
         // Non-message entries should NOT appear in to_messages()
@@ -8849,6 +8899,7 @@ mod tests {
             details: Some(serde_json::json!({"lines": 1, "truncated": false})),
             is_error: false,
             timestamp: Some(12346),
+            paused: None,
         });
 
         run_async(async { session.save().await }).unwrap();

@@ -1301,6 +1301,7 @@ mod tests {
             details: None,
             is_error: false,
             timestamp: None,
+            paused: None,
         }
     }
 
@@ -2032,6 +2033,7 @@ mod tests {
             details: None,
             is_error: false,
             timestamp: 0,
+            paused: None,
         })];
         assert!(serialize_conversation(&messages).contains("[Tool result]: file contents"));
     }

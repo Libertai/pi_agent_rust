@@ -79,6 +79,24 @@ pub struct ToolResultMessage {
     pub details: Option<serde_json::Value>,
     pub is_error: bool,
     pub timestamp: i64,
+    /// When `Some`, this entry is a *sentinel* placeholder for a tool that paused execution.
+    /// The agent loop appends one of these instead of calling the LLM, and replaces it with a
+    /// real result on resume. Old session files without this field deserialize as `None`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub paused: Option<PausedToolResult>,
+}
+
+/// Pause sentinel attached to a [`ToolResultMessage`].
+///
+/// Encodes the information required to resume a paused tool: the tool's `request_id` (for
+/// correlation), a `kind` (e.g. `"approval"`, `"ask_user"`), and an opaque tool-specific
+/// `payload` that the tool's [`crate::tools::Tool::resume`] receives verbatim.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PausedToolResult {
+    pub request_id: String,
+    pub kind: String,
+    pub payload: serde_json::Value,
 }
 
 /// A custom message injected by the host or extensions.
@@ -738,6 +756,7 @@ mod tests {
             details: Some(json!({"path": "/tmp/test.txt"})),
             is_error: false,
             timestamp: 99,
+            paused: None,
         });
         let json = serde_json::to_string(&msg).expect("serialize");
         let parsed: Message = serde_json::from_str(&json).expect("deserialize");
@@ -1284,6 +1303,7 @@ mod tests {
             details: None,
             is_error: false,
             timestamp: 0,
+            paused: None,
         };
         let json = serde_json::to_string(&tr).expect("serialize");
         assert!(!json.contains("details"));
@@ -1298,6 +1318,7 @@ mod tests {
             details: None,
             is_error: true,
             timestamp: 1,
+            paused: None,
         };
         let json = serde_json::to_string(&tr).expect("serialize");
         let parsed: ToolResultMessage = serde_json::from_str(&json).expect("deserialize");
@@ -1546,6 +1567,7 @@ mod tests {
                         details,
                         is_error,
                         timestamp,
+                        paused: None,
                     }
                 },
             )
