@@ -7663,7 +7663,7 @@ impl AgentSession {
         Ok(result)
     }
 
-    async fn persist_new_messages(&self, start_len: usize) -> Result<()> {
+    pub(crate) async fn persist_new_messages(&self, start_len: usize) -> Result<()> {
         let new_messages = self.agent.messages()[start_len..].to_vec();
         {
             let cx = crate::agent_cx::AgentCx::for_request();

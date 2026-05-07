@@ -1272,14 +1272,7 @@ impl AgentSessionHandle {
         &mut self,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
-        let combined = self.make_combined_callback(on_event);
-        self.session
-            .sync_runtime_selection_from_session_header()
-            .await?;
-        self.session
-            .agent
-            .run_continue_with_abort(None, combined)
-            .await
+        self.continue_turn_inner(None, on_event).await
     }
 
     /// Continue the current agent loop with an explicit abort signal.
@@ -1288,14 +1281,38 @@ impl AgentSessionHandle {
         abort_signal: AbortSignal,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
+        self.continue_turn_inner(Some(abort_signal), on_event).await
+    }
+
+    async fn continue_turn_inner(
+        &mut self,
+        abort: Option<AbortSignal>,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<AssistantMessage> {
         let combined = self.make_combined_callback(on_event);
         self.session
             .sync_runtime_selection_from_session_header()
             .await?;
-        self.session
+        // Mirror run_agent_with_text's persist contract: snapshot the
+        // pre-run message length, drive the loop, then persist every
+        // message the loop appended (assistant turn(s), tool result(s))
+        // through the session so they reach the JSONL. Without this
+        // step the follow-up turn produced after a paused-tool resume
+        // exists only in memory; the next session reload sees the
+        // resolved tool result but no assistant response, so the
+        // pause sentinel re-fires.
+        let start_len = self.session.agent.messages().len();
+        let result = self
+            .session
             .agent
-            .run_continue_with_abort(Some(abort_signal), combined)
-            .await
+            .run_continue_with_abort(abort, combined)
+            .await;
+        // Persist what was generated even if the agent stopped on
+        // an error, matching run_agent_with_text's ordering.
+        let persist_result = self.session.persist_new_messages(start_len).await;
+        let result = result?;
+        persist_result?;
+        Ok(result)
     }
 
     /// Create a new abort handle/signal pair for prompt cancellation.
