@@ -1669,6 +1669,18 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
     )
     .map_err(|err| Error::validation(err.to_string()))?;
 
+    if std::env::var_os("LIBERTAI_DUMP_SYSTEM_PROMPT").is_some() {
+        eprintln!("===BEGIN SYSTEM PROMPT===");
+        eprint!("{system_prompt}");
+        if !system_prompt.ends_with('\n') {
+            eprintln!();
+        }
+        eprintln!("===END SYSTEM PROMPT===");
+        if std::env::var_os("LIBERTAI_DUMP_AND_EXIT").is_some() {
+            std::process::exit(0);
+        }
+    }
+
     let provider = providers::create_provider(&selection.model_entry, None)
         .map_err(|e| Error::provider("sdk", e.to_string()))?;
 
