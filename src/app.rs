@@ -185,8 +185,18 @@ pub fn build_system_prompt(
         }
     }
 
+    if let Some(memory) = load_project_memory(cwd) {
+        let _ = write!(prompt, "\n\n## Memory\n\n{}\n", memory.trim_end());
+    }
+
     if let Some(skills_prompt) = skills_prompt {
         prompt.push_str(skills_prompt);
+    }
+
+    if !test_mode {
+        if let Some(git) = build_git_context(cwd) {
+            let _ = write!(prompt, "\n\n{git}");
+        }
     }
 
     let date_time = if test_mode {
@@ -205,6 +215,82 @@ pub fn build_system_prompt(
     }
 
     Ok(prompt)
+}
+
+/// Encode a canonical cwd as a Claude-Code-compatible single-segment
+/// directory name: `/foo/bar/baz` → `foo-bar-baz`. Used to look up
+/// per-project memory and (future) per-project state under a shared
+/// base directory. Falls back to the input path's string form when
+/// canonicalize fails (e.g. cwd no longer exists).
+pub fn encode_project_cwd(cwd: &Path) -> String {
+    let canonical = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let lossy = canonical.to_string_lossy();
+    let replaced = lossy.replace('/', "-");
+    replaced.trim_start_matches('-').to_string()
+}
+
+/// Load the per-project `MEMORY.md` if `PI_PROJECT_MEMORY_DIR` is set
+/// in the environment and the file exists. The full path resolved is
+/// `<PI_PROJECT_MEMORY_DIR>/<encode_project_cwd(cwd)>/MEMORY.md`.
+///
+/// Returns `None` when the env var is unset, the file is missing, or
+/// reading fails — the loader is a no-op by default so upstream pi
+/// behavior is preserved bit-for-bit.
+pub fn load_project_memory(cwd: &Path) -> Option<String> {
+    let base = std::env::var_os("PI_PROJECT_MEMORY_DIR")?;
+    let path = Path::new(&base)
+        .join(encode_project_cwd(cwd))
+        .join("MEMORY.md");
+    std::fs::read_to_string(path).ok()
+}
+
+/// Build a `## Git context` markdown block summarising the current
+/// branch, dirty files, recent commits, and committer for the agent's
+/// working directory. Returns `None` if `git` is unavailable, the
+/// directory isn't a git work tree, or any of the queries fail —
+/// callers should treat the block as best-effort metadata.
+fn build_git_context(cwd: &Path) -> Option<String> {
+    use std::fmt::Write as _;
+    use std::process::Command as ShCommand;
+
+    let inside = ShCommand::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .output()
+        .ok()?;
+    if !inside.status.success() {
+        return None;
+    }
+
+    let status = run_git(cwd, &["status", "-sb"])?;
+    let log = run_git(cwd, &["log", "--oneline", "-10"]).unwrap_or_default();
+    let user = run_git(cwd, &["config", "user.name"]).unwrap_or_default();
+
+    let mut out = String::from("## Git context\n\nStatus:\n```\n");
+    out.push_str(status.trim_end());
+    out.push_str("\n```\n\nRecent commits:\n```\n");
+    out.push_str(log.trim_end());
+    out.push_str("\n```\n");
+    let user_trimmed = user.trim();
+    if !user_trimmed.is_empty() {
+        let _ = write!(out, "\nGit user: {user_trimmed}\n");
+    }
+    Some(out)
+}
+
+fn run_git(cwd: &Path, args: &[&str]) -> Option<String> {
+    use std::process::Command as ShCommand;
+    let out = ShCommand::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8(out.stdout).ok()
 }
 
 fn resolve_prompt_input(input: Option<&str>, description: &str) -> Result<Option<String>> {
