@@ -1289,6 +1289,7 @@ impl PiApp {
                         &cwd,
                         shell_path.as_deref(),
                         command_prefix.as_deref(),
+                        None,
                         &command,
                         None,
                         None,

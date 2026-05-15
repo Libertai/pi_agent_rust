@@ -330,6 +330,14 @@ pub struct SessionOptions {
 
     /// Callback for raw provider [`StreamEvent`]s.
     pub on_stream_event: Option<OnStreamEvent>,
+
+    /// Override [`Config::bash_command_wrapper`] for this session. When
+    /// `Some`, the value replaces whatever was loaded from disk before
+    /// the tool registry is built, so `BashTool` instances pick it up
+    /// via [`default_tool_registry`]. Lets embedders (e.g. libertai-cli's
+    /// `--sandbox` flag, libertai-code-desktop's per-pillar policy) ship
+    /// a sandbox argv without writing to the user's config file.
+    pub bash_command_wrapper: Option<Vec<String>>,
 }
 
 impl Default for SessionOptions {
@@ -356,6 +364,7 @@ impl Default for SessionOptions {
             on_tool_start: None,
             on_tool_end: None,
             on_stream_event: None,
+            bash_command_wrapper: None,
         }
     }
 }
@@ -1729,7 +1738,15 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
         }
     }
 
-    let config = Config::load()?;
+    let mut config = Config::load()?;
+    // Per-session bash sandbox argv override. Lets embedders apply a
+    // policy without writing to the user's config file. Empty vec is
+    // treated as "no override" so callers can plumb an
+    // `Option<Vec<String>>` from a config-loading path without special-
+    // casing emptiness.
+    if let Some(wrapper) = options.bash_command_wrapper.clone() {
+        config.bash_command_wrapper = if wrapper.is_empty() { None } else { Some(wrapper) };
+    }
 
     let mut auth = AuthStorage::load_async(Config::auth_path()).await?;
     auth.refresh_expired_oauth_tokens().await?;
