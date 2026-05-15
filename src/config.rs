@@ -108,6 +108,13 @@ pub struct Config {
     pub shell_path: Option<String>,
     #[serde(alias = "shellCommandPrefix")]
     pub shell_command_prefix: Option<String>,
+    /// Argv prefix that wraps the bash shell when the bash tool spawns
+    /// a command. Empty (or `None`) means no wrapping. Pi makes no
+    /// policy judgment on the contents — callers (e.g. libertai-cli's
+    /// `--sandbox` flag) build the argv. See `BashTool::command_wrapper`
+    /// for the spawn-time semantics.
+    #[serde(default, alias = "bashCommandWrapper")]
+    pub bash_command_wrapper: Option<Vec<String>>,
     /// Override path to GitHub CLI (`gh`) for features like `/share`.
     #[serde(alias = "ghPath")]
     pub gh_path: Option<String>,
@@ -541,6 +548,7 @@ impl Config {
             // Shell
             shell_path: other.shell_path.or(base.shell_path),
             shell_command_prefix: other.shell_command_prefix.or(base.shell_command_prefix),
+            bash_command_wrapper: other.bash_command_wrapper.or(base.bash_command_wrapper),
             gh_path: other.gh_path.or(base.gh_path),
 
             // Images

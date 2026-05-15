@@ -2691,6 +2691,7 @@ impl ToolRegistry {
         let mut tools: Vec<Box<dyn Tool>> = Vec::new();
         let shell_path = config.and_then(|c| c.shell_path.clone());
         let shell_command_prefix = config.and_then(|c| c.shell_command_prefix.clone());
+        let bash_command_wrapper = config.and_then(|c| c.bash_command_wrapper.clone());
         let image_auto_resize = config.is_none_or(Config::image_auto_resize);
         let block_images = config
             .and_then(|c| c.images.as_ref().and_then(|i| i.block_images))
@@ -2703,11 +2704,17 @@ impl ToolRegistry {
                     image_auto_resize,
                     block_images,
                 ))),
-                "bash" => tools.push(Box::new(BashTool::with_shell(
-                    cwd,
-                    shell_path.clone(),
-                    shell_command_prefix.clone(),
-                ))),
+                "bash" => {
+                    let mut bash = BashTool::with_shell(
+                        cwd,
+                        shell_path.clone(),
+                        shell_command_prefix.clone(),
+                    );
+                    if let Some(wrapper) = bash_command_wrapper.clone() {
+                        bash = bash.with_command_wrapper(wrapper);
+                    }
+                    tools.push(Box::new(bash));
+                }
                 "edit" => tools.push(Box::new(EditTool::new(cwd))),
                 "write" => tools.push(Box::new(WriteTool::new(cwd))),
                 "grep" => tools.push(Box::new(GrepTool::new(cwd))),
@@ -3334,6 +3341,16 @@ pub struct BashTool {
     shell_path: Option<String>,
     command_prefix: Option<String>,
     artifact_root: Option<PathBuf>,
+    /// Argv prefix prepended to the shell invocation when spawning.
+    /// When `None`, the shell binary is exec'd directly (today's
+    /// behaviour). When `Some(wrapper)`, the spawn becomes
+    /// `wrapper[0] wrapper[1..] <shell> -c "<command>"`, which lets
+    /// callers wrap bash in a sandbox launcher (`bwrap`, `firejail`,
+    /// `sandbox-exec`, a custom helper binary on Windows, ...) without
+    /// pi knowing or caring which one. Pi makes no policy judgment on
+    /// the contents of the wrapper, the caller is responsible for
+    /// constructing an argv that does something useful.
+    command_wrapper: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -3384,11 +3401,12 @@ fn bash_cancellation_details(
     })
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub(crate) async fn run_bash_command(
     cwd: &Path,
     shell_path: Option<&str>,
     command_prefix: Option<&str>,
+    command_wrapper: Option<&[String]>,
     command: &str,
     timeout_secs: Option<u64>,
     on_update: Option<&(dyn Fn(ToolUpdate) + Send + Sync)>,
@@ -3423,8 +3441,24 @@ pub(crate) async fn run_bash_command(
         "sh"
     });
 
-    let mut cmd = command_with_default_sigpipe_in_dir(shell, cwd)
-        .map_err(|e| Error::tool("bash", format!("Failed to prepare shell: {e}")))?;
+    // When a wrapper argv is supplied, exec it instead of bash directly
+    // and pass the shell + `-c <command>` as trailing arguments. This is
+    // how callers inject `bwrap`/`firejail`/`sandbox-exec`/etc. without
+    // pi knowing anything about those tools — pi just spawns whatever
+    // argv it was handed.
+    let mut cmd = match command_wrapper.filter(|w| !w.is_empty()) {
+        Some(wrapper) => {
+            let mut c = command_with_default_sigpipe_in_dir(&wrapper[0], cwd)
+                .map_err(|e| Error::tool("bash", format!("Failed to prepare shell: {e}")))?;
+            if wrapper.len() > 1 {
+                c.args(&wrapper[1..]);
+            }
+            c.arg(shell);
+            c
+        }
+        None => command_with_default_sigpipe_in_dir(shell, cwd)
+            .map_err(|e| Error::tool("bash", format!("Failed to prepare shell: {e}")))?,
+    };
     cmd.arg("-c")
         .arg(&command)
         .current_dir(cwd)
@@ -3722,6 +3756,7 @@ impl BashTool {
             shell_path: None,
             command_prefix: None,
             artifact_root: None,
+            command_wrapper: None,
         }
     }
 
@@ -3735,6 +3770,7 @@ impl BashTool {
             shell_path,
             command_prefix,
             artifact_root: None,
+            command_wrapper: None,
         }
     }
 
@@ -3745,7 +3781,19 @@ impl BashTool {
             shell_path: None,
             command_prefix: None,
             artifact_root: Some(artifact_root.to_path_buf()),
+            command_wrapper: None,
         }
+    }
+
+    /// Set the argv prefix used when spawning bash. See the field doc on
+    /// `command_wrapper` for what this enables. An empty wrapper vector
+    /// is treated as "no wrapper" (same as `None`), so callers can plumb
+    /// an `Option<Vec<String>>` through config-loading without special-
+    /// casing emptiness.
+    #[must_use]
+    pub fn with_command_wrapper(mut self, wrapper: Vec<String>) -> Self {
+        self.command_wrapper = if wrapper.is_empty() { None } else { Some(wrapper) };
+        self
     }
 }
 
@@ -3797,6 +3845,7 @@ impl Tool for BashTool {
             &self.cwd,
             self.shell_path.as_deref(),
             self.command_prefix.as_deref(),
+            self.command_wrapper.as_deref(),
             &input.command,
             input.timeout,
             on_update.as_deref(),
@@ -9970,6 +10019,7 @@ mod tests {
                 tmp.path(),
                 None,
                 None,
+                None,
                 "(sleep 3; echo leaked > leaked_child.txt) & sleep 10",
                 Some(30),
                 None,
@@ -10202,6 +10252,43 @@ mod tests {
                 text.contains(&canonical.to_string_lossy().to_string()),
                 "expected cwd in output, got: {text}"
             );
+        });
+    }
+
+    #[test]
+    fn test_bash_command_wrapper_prefixes_argv() {
+        // Use `/usr/bin/env FOO=bar` as the wrapper: env sets FOO in the
+        // shell's environment, then exec's the shell with `-c <command>`.
+        // Without the wrapper, FOO is unset and `echo $FOO` prints empty.
+        // With the wrapper, it prints "wrapped". This verifies that:
+        //   (a) the wrapper argv is actually prepended,
+        //   (b) the wrapper's last arg becomes the shell binary,
+        //   (c) `-c <command>` is still appended after.
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            let tool = BashTool::new(tmp.path())
+                .with_command_wrapper(vec!["/usr/bin/env".into(), "FOO=wrapped".into()]);
+            let out = match tool
+                .execute("t", serde_json::json!({ "command": "echo $FOO" }), None)
+                .await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
+            let text = get_text(&out.content);
+            assert!(text.contains("wrapped"), "expected 'wrapped' in output, got: {text}");
+        });
+    }
+
+    #[test]
+    fn test_bash_empty_wrapper_treated_as_none() {
+        // An empty Vec should be coerced to None so callers can plumb
+        // an `Option<Vec<String>>` from config without special-casing.
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            let tool = BashTool::new(tmp.path())
+                .with_command_wrapper(vec![]);
+            let out = match tool
+                .execute("t", serde_json::json!({ "command": "echo ok" }), None)
+                .await.unwrap() { ToolExecution::Done(o) => o, _ => panic!("expected Done") };
+            let text = get_text(&out.content);
+            assert!(text.contains("ok"));
         });
     }
 
