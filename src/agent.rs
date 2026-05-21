@@ -8564,6 +8564,18 @@ impl AgentSession {
         self.compact_synchronous(Arc::new(on_event)).await
     }
 
+    /// Force-mode peer of [`compact_now`]. Skips the
+    /// `should_compact` threshold gate so a user-initiated `/compact`
+    /// runs even when the conversation hasn't yet reached the
+    /// auto-trigger size. The other no-op guards (empty history,
+    /// nothing to summarise) still apply.
+    pub async fn compact_now_force(
+        &mut self,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<()> {
+        self.compact_synchronous_force(Arc::new(on_event)).await
+    }
+
     pub async fn execute_extension_command(
         &mut self,
         command_name: &str,
@@ -8882,6 +8894,24 @@ impl AgentSession {
 
     /// Run compaction synchronously (inline), blocking until completion.
     async fn compact_synchronous(&self, on_event: AgentEventHandler) -> Result<()> {
+        self.compact_synchronous_inner(on_event, false).await
+    }
+
+    /// Force-mode variant: same flow as [`compact_synchronous`] but
+    /// bypasses the auto-trigger threshold so a user-initiated
+    /// `/compact` actually compresses history even when the
+    /// conversation is still well under the auto threshold. Returns
+    /// `Ok(())` only when something was compacted; the caller can
+    /// also rely on the emitted `AutoCompactionEnd` event.
+    async fn compact_synchronous_force(&self, on_event: AgentEventHandler) -> Result<()> {
+        self.compact_synchronous_inner(on_event, true).await
+    }
+
+    async fn compact_synchronous_inner(
+        &self,
+        on_event: AgentEventHandler,
+        force: bool,
+    ) -> Result<()> {
         if !self.compaction_settings.enabled {
             return Ok(());
         }
@@ -8899,7 +8929,15 @@ impl AgentSession {
                 .into_iter()
                 .cloned()
                 .collect::<Vec<_>>();
-            let prep = compaction::prepare_compaction(&entries, self.compaction_settings.clone());
+            // Force mode skips the threshold gate so manual `/compact`
+            // always tries to compress; the empty-history / nothing-
+            // to-summarise guards inside `prepare_compaction_force`
+            // still apply so we don't emit garbage summary entries.
+            let prep = if force {
+                compaction::prepare_compaction_force(&entries, self.compaction_settings.clone())
+            } else {
+                compaction::prepare_compaction(&entries, self.compaction_settings.clone())
+            };
             (entries, prep)
         };
 
