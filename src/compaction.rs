@@ -1006,8 +1006,47 @@ pub fn prepare_compaction(
     path_entries: &[SessionEntry],
     settings: ResolvedCompactionSettings,
 ) -> Option<CompactionPreparation> {
+    prepare_compaction_inner(path_entries, settings, false)
+}
+
+/// Variant of [`prepare_compaction`] that bypasses the
+/// `should_compact` threshold gate. Use when the user explicitly
+/// asked for a compaction (manual `/compact`); the auto-trigger path
+/// still calls [`prepare_compaction`] so background compactions only
+/// fire when there's something worth compressing.
+///
+/// The other no-op guards (empty entries, last entry already a
+/// compaction, nothing to summarise) still apply — "force" means
+/// "skip the threshold", not "compact garbage and produce a no-op
+/// summary entry".
+pub fn prepare_compaction_force(
+    path_entries: &[SessionEntry],
+    settings: ResolvedCompactionSettings,
+) -> Option<CompactionPreparation> {
+    prepare_compaction_inner(path_entries, settings, true)
+}
+
+/// In force mode (manual `/compact`), clamp `keep_recent_tokens` so a
+/// small history still has something to summarise. Default
+/// `keep_recent_tokens` is sized for the auto-trigger path, where
+/// compaction only fires near the context limit and we want a generous
+/// verbatim tail. When the user says "compact NOW", a 12.8K-token tail
+/// budget swallows the entire history and the summariser gets nothing.
+/// Keeping ~1 exchange (≈2K tokens) verbatim leaves the rest to be
+/// compressed.
+const FORCE_KEEP_RECENT_TOKENS_CAP: u32 = 2048;
+
+fn prepare_compaction_inner(
+    path_entries: &[SessionEntry],
+    mut settings: ResolvedCompactionSettings,
+    force: bool,
+) -> Option<CompactionPreparation> {
     if path_entries.is_empty() {
         return None;
+    }
+
+    if force {
+        settings.keep_recent_tokens = settings.keep_recent_tokens.min(FORCE_KEEP_RECENT_TOKENS_CAP);
     }
 
     if path_entries
@@ -1041,7 +1080,7 @@ pub fn prepare_compaction(
     // of the history prior to the new cut point.
     let tokens_before = estimate_context_tokens(&usage_messages).tokens;
 
-    if !should_compact(tokens_before, settings.context_window_tokens, &settings) {
+    if !force && !should_compact(tokens_before, settings.context_window_tokens, &settings) {
         return None;
     }
 
@@ -2113,6 +2152,70 @@ mod tests {
     fn prepare_compaction_last_is_compaction_returns_none() {
         let entries = vec![user_entry("1", "hello"), compact_entry("2", "summary", 100)];
         assert!(prepare_compaction(&entries, ResolvedCompactionSettings::default()).is_none());
+    }
+
+    #[test]
+    fn prepare_compaction_force_bypasses_threshold() {
+        // Tiny conversation, well under the threshold. Auto path returns
+        // None (correct), force path returns Some (user said "do it").
+        let entries = vec![
+            user_entry("1", "hello"),
+            assistant_entry("2", "hi back", 4, 2),
+            user_entry("3", "another message"),
+            assistant_entry("4", "another reply", 4, 2),
+        ];
+        let settings = ResolvedCompactionSettings {
+            enabled: true,
+            context_window_tokens: 100_000,
+            reserve_tokens: 10_000, // threshold ≈ 90k, we have ~12 tokens
+            keep_recent_tokens: 1,
+        };
+        assert!(
+            prepare_compaction(&entries, settings.clone()).is_none(),
+            "auto path should skip when well below threshold"
+        );
+        assert!(
+            prepare_compaction_force(&entries, settings).is_some(),
+            "force path should compact below threshold"
+        );
+    }
+
+    #[test]
+    fn prepare_compaction_force_clamps_keep_recent_for_small_history() {
+        // Realistic case: 30%-of-window history with the default 12.8K
+        // keep_recent_tokens. Auto path bails on threshold; without the
+        // clamp the force path would also no-op (history fits in keep
+        // budget). The clamp brings keep_recent down to ~2K so there's
+        // something to summarise.
+        let long_text = "a".repeat(12_000); // ≈4K tokens
+        let entries = vec![
+            user_entry("1", &long_text),
+            assistant_entry("2", &long_text, 4000, 2000),
+            user_entry("3", &long_text),
+            assistant_entry("4", &long_text, 4000, 2000),
+            user_entry("5", "recent"),
+        ];
+        let settings = ResolvedCompactionSettings {
+            enabled: true,
+            context_window_tokens: 64_000,
+            reserve_tokens: 10_000,
+            keep_recent_tokens: 12_800,
+        };
+        assert!(
+            prepare_compaction_force(&entries, settings).is_some(),
+            "force path should produce a summary even with default 12.8K keep budget"
+        );
+    }
+
+    #[test]
+    fn prepare_compaction_force_still_skips_empty_history() {
+        // Force only skips the threshold gate — empty entries and
+        // last-entry-is-compaction guards must still hold so we don't
+        // emit garbage no-op compactions on a brand-new session.
+        let settings = ResolvedCompactionSettings::default();
+        assert!(prepare_compaction_force(&[], settings.clone()).is_none());
+        let only_compact = vec![compact_entry("1", "summary", 100)];
+        assert!(prepare_compaction_force(&only_compact, settings).is_none());
     }
 
     #[test]

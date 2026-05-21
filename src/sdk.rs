@@ -1515,11 +1515,28 @@ impl AgentSessionHandle {
     }
 
     /// Trigger an immediate compaction pass (if compaction is enabled).
+    ///
+    /// This path still honours the auto-compaction threshold — pi only
+    /// does work when the conversation is large enough to be worth
+    /// summarising. For user-initiated "compact now no matter what"
+    /// semantics, use [`compact_force`](Self::compact_force).
     pub async fn compact(
         &mut self,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<()> {
         self.session.compact_now(on_event).await
+    }
+
+    /// Force-mode peer of [`compact`](Self::compact). Bypasses the
+    /// threshold gate so an explicit user request (`/compact` slash,
+    /// "Apply now" button) compresses history regardless of how full
+    /// the context is. Other no-op guards (empty history, nothing to
+    /// summarise, last entry already a compaction) still apply.
+    pub async fn compact_force(
+        &mut self,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<()> {
+        self.session.compact_now_force(on_event).await
     }
 
     /// Access the underlying `AgentSession`.
