@@ -2293,6 +2293,146 @@ fn read_dedup_output(message: String, is_error: bool, warning: bool) -> ToolExec
     .into()
 }
 
+fn redact_read_secrets(text: &str) -> (String, usize) {
+    let mut count = 0usize;
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let (line, n) = redact_sensitive_assignments(line);
+        count = count.saturating_add(n);
+        let (line, n) = redact_known_secret_tokens(&line);
+        count = count.saturating_add(n);
+        out.push(line);
+    }
+    let mut redacted = out.join("\n");
+    if text.ends_with('\n') {
+        redacted.push('\n');
+    }
+    (redacted, count)
+}
+
+fn redact_sensitive_assignments(line: &str) -> (String, usize) {
+    let mut out = String::with_capacity(line.len());
+    let mut cursor = 0usize;
+    let mut count = 0usize;
+
+    while let Some((_, sep_idx, value_start)) = find_sensitive_assignment(&line[cursor..]) {
+        let sep_idx = cursor + sep_idx;
+        let value_start = cursor + value_start;
+        let value_end = line[value_start..]
+            .find(|c: char| c == ',' || c == ';' || c == '&' || c.is_whitespace())
+            .map_or(line.len(), |idx| value_start + idx);
+        if value_start >= value_end {
+            break;
+        }
+
+        out.push_str(&line[cursor..sep_idx + 1]);
+        let whitespace_len = line[sep_idx + 1..value_start]
+            .chars()
+            .take_while(|c| c.is_whitespace())
+            .map(char::len_utf8)
+            .sum::<usize>();
+        out.push_str(&line[sep_idx + 1..sep_idx + 1 + whitespace_len]);
+        out.push_str("[REDACTED]");
+        count = count.saturating_add(1);
+        cursor = value_end;
+    }
+
+    if count == 0 {
+        (line.to_string(), 0)
+    } else {
+        out.push_str(&line[cursor..]);
+        (out, count)
+    }
+}
+
+fn find_sensitive_assignment(line: &str) -> Option<(usize, usize, usize)> {
+    let bytes = line.as_bytes();
+    for (idx, byte) in bytes.iter().enumerate() {
+        if !matches!(byte, b'=' | b':') {
+            continue;
+        }
+        let key_start = line[..idx]
+            .char_indices()
+            .rev()
+            .find(|(_, c)| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')))
+            .map_or(0, |(pos, c)| pos + c.len_utf8());
+        let key = line[key_start..idx].trim();
+        if !is_sensitive_key(key) {
+            continue;
+        }
+        let value_start = idx + 1 + line[idx + 1..]
+            .chars()
+            .take_while(|c| c.is_whitespace() || matches!(c, '"' | '\''))
+            .map(char::len_utf8)
+            .sum::<usize>();
+        return Some((key_start, idx, value_start));
+    }
+    None
+}
+
+fn is_sensitive_key(key: &str) -> bool {
+    let key = key.trim_matches(|c: char| matches!(c, '"' | '\'' | '`'));
+    let lower = key.to_ascii_lowercase();
+    if lower.starts_with("not_") {
+        return false;
+    }
+    lower == "token"
+        || lower == "secret"
+        || lower == "password"
+        || lower == "passwd"
+        || lower == "api_key"
+        || lower == "apikey"
+        || lower == "access_token"
+        || lower == "refresh_token"
+        || lower == "client_secret"
+        || lower == "private_key"
+        || lower.ends_with("_token")
+        || lower.ends_with("_secret")
+        || lower.ends_with("_password")
+        || lower.ends_with("_api_key")
+}
+
+fn redact_known_secret_tokens(line: &str) -> (String, usize) {
+    let mut out = String::with_capacity(line.len());
+    let mut count = 0usize;
+    for (idx, segment) in line.split_inclusive(|c: char| c.is_whitespace()).enumerate() {
+        let (trimmed, suffix) = split_trailing_space(segment);
+        if idx > 0 && trimmed.is_empty() {
+            out.push_str(segment);
+            continue;
+        }
+        if is_known_secret_token(trimmed) {
+            out.push_str("[REDACTED]");
+            out.push_str(suffix);
+            count = count.saturating_add(1);
+        } else {
+            out.push_str(segment);
+        }
+    }
+    (out, count)
+}
+
+fn split_trailing_space(segment: &str) -> (&str, &str) {
+    let end = segment.trim_end_matches(char::is_whitespace).len();
+    (&segment[..end], &segment[end..])
+}
+
+fn is_known_secret_token(token: &str) -> bool {
+    let token = token.trim_matches(|c: char| {
+        matches!(c, '"' | '\'' | '`' | ',' | ';' | ')' | '(' | '[' | ']' | '{' | '}')
+    });
+    let len = token.len();
+    (token.starts_with("sk-") && len >= 16)
+        || (token.starts_with("ghp_") && len >= 20)
+        || (token.starts_with("github_pat_") && len >= 24)
+        || (token.starts_with("xoxb-") && len >= 16)
+        || (token.starts_with("xoxp-") && len >= 16)
+        || (token.starts_with("xoxa-") && len >= 16)
+        || (token.starts_with("AIza") && len >= 20)
+        || (token.starts_with("AKIA") && len >= 20)
+        || (token.starts_with("ASIA") && len >= 20)
+}
+
 // ============================================================================
 // CLI @file Processor (used by src/main.rs)
 // ============================================================================
@@ -3490,6 +3630,19 @@ impl Tool for ReadTool {
                     "\n\n[{remaining} more lines in file. Use offset={next_offset} to continue.]"
                 );
             }
+        }
+
+        let (mut output_text, redactions) = redact_read_secrets(&output_text);
+        if redactions > 0 {
+            let mut details_map = details
+                .take()
+                .and_then(|details| details.as_object().cloned())
+                .unwrap_or_default();
+            details_map.insert(
+                "redactions".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(redactions)),
+            );
+            details = Some(serde_json::Value::Object(details_map));
         }
 
         if let Some(artifact_source) = artifact_source.as_deref() {
@@ -9371,6 +9524,67 @@ mod tests {
             };
             assert!(!fresh.is_error);
             assert!(get_text(&fresh.content).contains("after"));
+        });
+    }
+
+    #[test]
+    fn test_redact_read_secrets_masks_prefixes_and_sensitive_keys() {
+        let input = "\
+token=plain-secret
+url=https://example.test/callback?api_key=abc123&next=ok&password=hunter2
+openai sk-1234567890abcdef
+github ghp_1234567890abcdefghijkl
+google AIza1234567890abcdefghijkl
+keep NOT_A_SECRET=visible";
+
+        let (redacted, count) = redact_read_secrets(input);
+        assert_eq!(count, 6);
+        assert!(!redacted.contains("plain-secret"));
+        assert!(!redacted.contains("abc123"));
+        assert!(!redacted.contains("hunter2"));
+        assert!(!redacted.contains("sk-1234567890abcdef"));
+        assert!(!redacted.contains("ghp_1234567890abcdefghijkl"));
+        assert!(!redacted.contains("AIza1234567890abcdefghijkl"));
+        assert!(redacted.contains("NOT_A_SECRET=visible"));
+    }
+
+    #[test]
+    fn test_read_redacts_secrets_in_tool_output() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("secrets.env");
+            std::fs::write(
+                &path,
+                "API_KEY=super-secret\nOPENAI_TOKEN=sk-1234567890abcdef\nvisible=value",
+            )
+            .unwrap();
+
+            let tool = ReadTool::new(tmp.path());
+            let out = match tool
+                .execute(
+                    "read",
+                    serde_json::json!({ "path": path.to_string_lossy() }),
+                    None,
+                )
+                .await
+                .unwrap()
+            {
+                ToolExecution::Done(o) => o,
+                _ => panic!("expected Done"),
+            };
+
+            let text = get_text(&out.content);
+            assert!(!text.contains("super-secret"));
+            assert!(!text.contains("sk-1234567890abcdef"));
+            assert!(text.contains("[REDACTED]"));
+            assert!(text.contains("visible=value"));
+            assert_eq!(
+                out.details
+                    .as_ref()
+                    .and_then(|details| details.get("redactions"))
+                    .and_then(serde_json::Value::as_u64),
+                Some(2)
+            );
         });
     }
 
