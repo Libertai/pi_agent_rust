@@ -23,7 +23,7 @@ use std::fmt::Write as _;
 use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Mutex, OnceLock, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use unicode_normalization::UnicodeNormalization;
@@ -2144,6 +2144,69 @@ fn enforce_read_scope(path: &Path, cwd: &Path) -> Result<PathBuf> {
     enforce_read_scope_with_roots(path, cwd, &agent_dir)
 }
 
+#[derive(Debug, Default)]
+struct FileToolState {
+    read_mtimes: HashMap<PathBuf, SystemTime>,
+}
+
+impl FileToolState {
+    fn record_read(&mut self, path: &Path, modified: SystemTime) {
+        self.read_mtimes.insert(path.to_path_buf(), modified);
+    }
+
+    fn stale_write_warning(&self, path: &Path, current_mtime: SystemTime) -> Option<String> {
+        let read_mtime = self.read_mtimes.get(path)?;
+        if current_mtime > *read_mtime {
+            Some(format!(
+                "Warning: {} changed on disk after the last read; verify the current file before relying on this edit.",
+                path.display()
+            ))
+        } else {
+            None
+        }
+    }
+
+    fn invalidate(&mut self, path: &Path) {
+        self.read_mtimes.remove(path);
+    }
+}
+
+type SharedFileToolState = Arc<Mutex<FileToolState>>;
+
+fn shared_file_tool_state() -> SharedFileToolState {
+    Arc::new(Mutex::new(FileToolState::default()))
+}
+
+fn record_file_read(state: &SharedFileToolState, path: &Path, modified: SystemTime) {
+    if let Ok(mut state) = state.lock() {
+        state.record_read(path, modified);
+    }
+}
+
+fn stale_write_warning(
+    state: &SharedFileToolState,
+    path: &Path,
+    current_mtime: SystemTime,
+) -> Option<String> {
+    state
+        .lock()
+        .ok()
+        .and_then(|state| state.stale_write_warning(path, current_mtime))
+}
+
+fn invalidate_file_read(state: &SharedFileToolState, path: &Path) {
+    if let Ok(mut state) = state.lock() {
+        state.invalidate(path);
+    }
+}
+
+fn attach_warning(details: &mut serde_json::Map<String, serde_json::Value>, warning: &str) {
+    details.insert(
+        "_warning".to_string(),
+        serde_json::Value::String(warning.to_string()),
+    );
+}
+
 // ============================================================================
 // CLI @file Processor (used by src/main.rs)
 // ============================================================================
@@ -2696,13 +2759,15 @@ impl ToolRegistry {
         let block_images = config
             .and_then(|c| c.images.as_ref().and_then(|i| i.block_images))
             .unwrap_or(false);
+        let file_state = shared_file_tool_state();
 
         for name in enabled {
             match *name {
-                "read" => tools.push(Box::new(ReadTool::with_settings(
+                "read" => tools.push(Box::new(ReadTool::with_settings_and_state(
                     cwd,
                     image_auto_resize,
                     block_images,
+                    Arc::clone(&file_state),
                 ))),
                 "bash" => {
                     let mut bash = BashTool::with_shell(
@@ -2715,12 +2780,21 @@ impl ToolRegistry {
                     }
                     tools.push(Box::new(bash));
                 }
-                "edit" => tools.push(Box::new(EditTool::new(cwd))),
-                "write" => tools.push(Box::new(WriteTool::new(cwd))),
+                "edit" => tools.push(Box::new(EditTool::with_file_state(
+                    cwd,
+                    Arc::clone(&file_state),
+                ))),
+                "write" => tools.push(Box::new(WriteTool::with_file_state(
+                    cwd,
+                    Arc::clone(&file_state),
+                ))),
                 "grep" => tools.push(Box::new(GrepTool::new(cwd))),
                 "find" => tools.push(Box::new(FindTool::new(cwd))),
                 "ls" => tools.push(Box::new(LsTool::new(cwd))),
-                "hashline_edit" => tools.push(Box::new(HashlineEditTool::new(cwd))),
+                "hashline_edit" => tools.push(Box::new(HashlineEditTool::with_file_state(
+                    cwd,
+                    Arc::clone(&file_state),
+                ))),
                 _ => {}
             }
         }
@@ -2786,6 +2860,7 @@ pub struct ReadTool {
     auto_resize: bool,
     block_images: bool,
     artifact_root: Option<PathBuf>,
+    file_state: SharedFileToolState,
 }
 
 impl ReadTool {
@@ -2795,15 +2870,26 @@ impl ReadTool {
             auto_resize: true,
             block_images: false,
             artifact_root: None,
+            file_state: shared_file_tool_state(),
         }
     }
 
     pub fn with_settings(cwd: &Path, auto_resize: bool, block_images: bool) -> Self {
+        Self::with_settings_and_state(cwd, auto_resize, block_images, shared_file_tool_state())
+    }
+
+    fn with_settings_and_state(
+        cwd: &Path,
+        auto_resize: bool,
+        block_images: bool,
+        file_state: SharedFileToolState,
+    ) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
             auto_resize,
             block_images,
             artifact_root: None,
+            file_state,
         }
     }
 
@@ -2814,6 +2900,7 @@ impl ReadTool {
             auto_resize: true,
             block_images: false,
             artifact_root: Some(artifact_root.to_path_buf()),
+            file_state: shared_file_tool_state(),
         }
     }
 }
@@ -3034,6 +3121,12 @@ impl Tool for ReadTool {
                 }
             }
 
+            if let Some(meta) = &meta {
+                if let Ok(modified) = meta.modified() {
+                    record_file_read(&self.file_state, &path, modified);
+                }
+            }
+
             return Ok(ToolOutput {
                 content: vec![
                     ContentBlock::Text(TextContent::new(note)),
@@ -3162,6 +3255,11 @@ impl Tool for ReadTool {
                         "Offset {offset_display} is beyond end of file ({total_lines} lines total)"
                     ),
                 ));
+            }
+            if let Some(meta) = &meta {
+                if let Ok(modified) = meta.modified() {
+                    record_file_read(&self.file_state, &path, modified);
+                }
             }
             let output = ToolOutput {
                 content: vec![ContentBlock::Text(TextContent::new(""))],
@@ -3308,6 +3406,12 @@ impl Tool for ReadTool {
                 "selectedTextWindow",
                 artifact_source,
             );
+        }
+
+        if let Some(meta) = &meta {
+            if let Ok(modified) = meta.modified() {
+                record_file_read(&self.file_state, &path, modified);
+            }
         }
 
         let output = ToolOutput {
@@ -3914,12 +4018,18 @@ struct EditInput {
 
 pub struct EditTool {
     cwd: PathBuf,
+    file_state: SharedFileToolState,
 }
 
 impl EditTool {
     pub fn new(cwd: &Path) -> Self {
+        Self::with_file_state(cwd, shared_file_tool_state())
+    }
+
+    fn with_file_state(cwd: &Path, file_state: SharedFileToolState) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
+            file_state,
         }
     }
 }
@@ -4572,6 +4682,10 @@ impl Tool for EditTool {
                 ),
             ));
         }
+        let stale_warning = meta
+            .modified()
+            .ok()
+            .and_then(|mtime| stale_write_warning(&self.file_state, &absolute_path, mtime));
 
         if let Err(err) = asupersync::fs::OpenOptions::new()
             .read(true)
@@ -4782,6 +4896,7 @@ impl Tool for EditTool {
         })
         .await
         .map_err(|e| Error::tool("edit", format!("Failed to write file: {e}")))?;
+        invalidate_file_read(&self.file_state, &absolute_path);
 
         let (diff, first_changed_line) =
             generate_diff_string(&normalized_content, &new_content_for_diff);
@@ -4792,6 +4907,9 @@ impl Tool for EditTool {
                 "firstChangedLine".to_string(),
                 serde_json::Value::Number(serde_json::Number::from(line)),
             );
+        }
+        if let Some(warning) = stale_warning {
+            attach_warning(&mut details, &warning);
         }
 
         Ok(ToolOutput {
@@ -4819,12 +4937,18 @@ struct WriteInput {
 
 pub struct WriteTool {
     cwd: PathBuf,
+    file_state: SharedFileToolState,
 }
 
 impl WriteTool {
     pub fn new(cwd: &Path) -> Self {
+        Self::with_file_state(cwd, shared_file_tool_state())
+    }
+
+    fn with_file_state(cwd: &Path, file_state: SharedFileToolState) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
+            file_state,
         }
     }
 }
@@ -4880,6 +5004,7 @@ impl Tool for WriteTool {
         let path = resolve_path(&input.path, &self.cwd);
         let path = enforce_cwd_scope(&path, &self.cwd, "write")?;
 
+        let mut stale_warning = None;
         if let Ok(meta) = asupersync::fs::metadata(&path).await {
             if !meta.is_file() {
                 return Err(Error::tool(
@@ -4887,6 +5012,10 @@ impl Tool for WriteTool {
                     format!("Path {} is not a regular file", path.display()),
                 ));
             }
+            stale_warning = meta
+                .modified()
+                .ok()
+                .and_then(|mtime| stale_write_warning(&self.file_state, &path, mtime));
             if let Err(err) = asupersync::fs::OpenOptions::new()
                 .write(true)
                 .open(&path)
@@ -4946,12 +5075,19 @@ impl Tool for WriteTool {
         .await
         .map_err(|e| Error::tool("write", format!("Failed to write file: {e}")))?;
 
+        invalidate_file_read(&self.file_state, &path);
+        let details = stale_warning.map(|warning| {
+            let mut details = serde_json::Map::new();
+            attach_warning(&mut details, &warning);
+            serde_json::Value::Object(details)
+        });
+
         Ok(ToolOutput {
             content: vec![ContentBlock::Text(TextContent::new(format!(
                 "Successfully wrote {} bytes to {}",
                 bytes_written, input.path
             )))],
-            details: None,
+            details,
             is_error: false,
         }.into())
     }
@@ -7286,12 +7422,18 @@ struct ResolvedEdit<'a> {
 
 pub struct HashlineEditTool {
     cwd: PathBuf,
+    file_state: SharedFileToolState,
 }
 
 impl HashlineEditTool {
     pub fn new(cwd: &Path) -> Self {
+        Self::with_file_state(cwd, shared_file_tool_state())
+    }
+
+    fn with_file_state(cwd: &Path, file_state: SharedFileToolState) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
+            file_state,
         }
     }
 }
@@ -7504,6 +7646,10 @@ impl Tool for HashlineEditTool {
                 ),
             ));
         }
+        let stale_warning = metadata
+            .modified()
+            .ok()
+            .and_then(|mtime| stale_write_warning(&self.file_state, &absolute_path, mtime));
 
         // Read file content
         let file = asupersync::fs::File::open(&absolute_path)
@@ -7791,6 +7937,7 @@ impl Tool for HashlineEditTool {
         })
         .await
         .map_err(|e| Error::tool("hashline_edit", format!("Failed to write file: {e}")))?;
+        invalidate_file_read(&self.file_state, &absolute_path);
 
         // Generate diff
         let (diff, first_changed_line) = generate_diff_string(&normalized, &new_normalized);
@@ -7801,6 +7948,9 @@ impl Tool for HashlineEditTool {
                 "firstChangedLine".to_string(),
                 serde_json::Value::Number(serde_json::Number::from(line)),
             );
+        }
+        if let Some(warning) = stale_warning {
+            attach_warning(&mut details, &warning);
         }
 
         Ok(ToolOutput {
@@ -7824,6 +7974,18 @@ mod tests {
     use proptest::prelude::*;
     #[cfg(target_os = "linux")]
     use std::time::Duration;
+
+    fn wait_until_modified_after(path: &Path, previous: SystemTime) {
+        for i in 0..20 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            std::fs::write(path, format!("external change {i}")).unwrap();
+            let modified = std::fs::metadata(path).unwrap().modified().unwrap();
+            if modified > previous {
+                return;
+            }
+        }
+        panic!("file modification time did not advance");
+    }
 
     #[test]
     fn test_builtin_tool_descriptions_carry_usage_guidance() {
@@ -9560,6 +9722,68 @@ mod tests {
             assert!(!out.is_error);
             let contents = std::fs::read_to_string(tmp.path().join("exist.txt")).unwrap();
             assert_eq!(contents, "new content");
+        });
+    }
+
+    #[test]
+    fn test_write_warns_when_file_changed_since_read() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("stale.txt");
+            std::fs::write(&path, "first").unwrap();
+            let first_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+            let file_state = shared_file_tool_state();
+            let read = ReadTool::with_settings_and_state(
+                tmp.path(),
+                true,
+                false,
+                Arc::clone(&file_state),
+            );
+            let write = WriteTool::with_file_state(tmp.path(), Arc::clone(&file_state));
+
+            let out = match read
+                .execute(
+                    "read",
+                    serde_json::json!({ "path": path.to_string_lossy() }),
+                    None,
+                )
+                .await
+                .unwrap()
+            {
+                ToolExecution::Done(o) => o,
+                _ => panic!("expected Done"),
+            };
+            assert!(!out.is_error);
+
+            wait_until_modified_after(&path, first_mtime);
+
+            let out = match write
+                .execute(
+                    "write",
+                    serde_json::json!({
+                        "path": path.to_string_lossy(),
+                        "content": "agent edit"
+                    }),
+                    None,
+                )
+                .await
+                .unwrap()
+            {
+                ToolExecution::Done(o) => o,
+                _ => panic!("expected Done"),
+            };
+            assert!(!out.is_error);
+            let warning = out
+                .details
+                .as_ref()
+                .and_then(|details| details.get("_warning"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            assert!(
+                warning.contains("changed on disk after the last read"),
+                "expected stale-write warning, got: {warning:?}"
+            );
         });
     }
 
