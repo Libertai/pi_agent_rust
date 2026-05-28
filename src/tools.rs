@@ -2147,11 +2147,75 @@ fn enforce_read_scope(path: &Path, cwd: &Path) -> Result<PathBuf> {
 #[derive(Debug, Default)]
 struct FileToolState {
     read_mtimes: HashMap<PathBuf, SystemTime>,
+    repeated_reads: HashMap<ReadDedupKey, ReadDedupRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ReadDedupKey {
+    path: PathBuf,
+    offset: Option<i64>,
+    limit: Option<i64>,
+    hashline: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ReadDedupRecord {
+    modified: SystemTime,
+    count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReadDedupDecision {
+    Allow,
+    Stub(String),
+    Warn(String),
+    Block(String),
 }
 
 impl FileToolState {
-    fn record_read(&mut self, path: &Path, modified: SystemTime) {
+    fn observe_read(
+        &mut self,
+        path: &Path,
+        offset: Option<i64>,
+        limit: Option<i64>,
+        hashline: bool,
+        modified: SystemTime,
+    ) -> ReadDedupDecision {
         self.read_mtimes.insert(path.to_path_buf(), modified);
+        let key = ReadDedupKey {
+            path: path.to_path_buf(),
+            offset,
+            limit,
+            hashline,
+        };
+        let record = self
+            .repeated_reads
+            .entry(key)
+            .and_modify(|record| {
+                if record.modified == modified {
+                    record.count = record.count.saturating_add(1);
+                } else {
+                    record.modified = modified;
+                    record.count = 1;
+                }
+            })
+            .or_insert(ReadDedupRecord { modified, count: 1 });
+
+        match record.count {
+            0 | 1 => ReadDedupDecision::Allow,
+            2 => ReadDedupDecision::Stub(format!(
+                "{} is unchanged since the previous read of this same range; reuse the prior result instead of reading it again.",
+                path.display()
+            )),
+            3 => ReadDedupDecision::Warn(format!(
+                "{} has already been read repeatedly with unchanged contents; avoid another identical read unless new information is needed.",
+                path.display()
+            )),
+            count => ReadDedupDecision::Block(format!(
+                "read blocked: {} has been read {count} times with identical range arguments and unchanged mtime; use the previous result, read a different range, or explain why another read is necessary.",
+                path.display()
+            )),
+        }
     }
 
     fn stale_write_warning(&self, path: &Path, current_mtime: SystemTime) -> Option<String> {
@@ -2168,6 +2232,7 @@ impl FileToolState {
 
     fn invalidate(&mut self, path: &Path) {
         self.read_mtimes.remove(path);
+        self.repeated_reads.retain(|key, _| key.path != path);
     }
 }
 
@@ -2177,10 +2242,17 @@ fn shared_file_tool_state() -> SharedFileToolState {
     Arc::new(Mutex::new(FileToolState::default()))
 }
 
-fn record_file_read(state: &SharedFileToolState, path: &Path, modified: SystemTime) {
-    if let Ok(mut state) = state.lock() {
-        state.record_read(path, modified);
-    }
+fn observe_file_read(
+    state: &SharedFileToolState,
+    path: &Path,
+    offset: Option<i64>,
+    limit: Option<i64>,
+    hashline: bool,
+    modified: SystemTime,
+) -> ReadDedupDecision {
+    state.lock().map_or(ReadDedupDecision::Allow, |mut state| {
+        state.observe_read(path, offset, limit, hashline, modified)
+    })
 }
 
 fn stale_write_warning(
@@ -2205,6 +2277,20 @@ fn attach_warning(details: &mut serde_json::Map<String, serde_json::Value>, warn
         "_warning".to_string(),
         serde_json::Value::String(warning.to_string()),
     );
+}
+
+fn read_dedup_output(message: String, is_error: bool, warning: bool) -> ToolExecution {
+    let mut details = serde_json::Map::new();
+    details.insert("deduplicated".to_string(), serde_json::Value::Bool(true));
+    if warning {
+        attach_warning(&mut details, &message);
+    }
+    ToolOutput {
+        content: vec![ContentBlock::Text(TextContent::new(message))],
+        details: Some(serde_json::Value::Object(details)),
+        is_error,
+    }
+    .into()
 }
 
 // ============================================================================
@@ -2999,6 +3085,27 @@ impl Tool for ReadTool {
                     format!("Path {} is not a regular file", path.display()),
                 ));
             }
+            if let Ok(modified) = meta.modified() {
+                match observe_file_read(
+                    &self.file_state,
+                    &path,
+                    input.offset,
+                    input.limit,
+                    input.hashline,
+                    modified,
+                ) {
+                    ReadDedupDecision::Allow => {}
+                    ReadDedupDecision::Stub(message) => {
+                        return Ok(read_dedup_output(message, false, false));
+                    }
+                    ReadDedupDecision::Warn(message) => {
+                        return Ok(read_dedup_output(message, false, true));
+                    }
+                    ReadDedupDecision::Block(message) => {
+                        return Ok(read_dedup_output(message, true, true));
+                    }
+                }
+            }
         }
 
         let cache_key = tool_cache_key("read", &self.cwd, &input_value);
@@ -3118,12 +3225,6 @@ impl Tool for ReadTool {
                         let _ =
                             write!(note, "\n[Image: original {ow}x{oh}, displayed at {w}x{h}.]");
                     }
-                }
-            }
-
-            if let Some(meta) = &meta {
-                if let Ok(modified) = meta.modified() {
-                    record_file_read(&self.file_state, &path, modified);
                 }
             }
 
@@ -3255,11 +3356,6 @@ impl Tool for ReadTool {
                         "Offset {offset_display} is beyond end of file ({total_lines} lines total)"
                     ),
                 ));
-            }
-            if let Some(meta) = &meta {
-                if let Ok(modified) = meta.modified() {
-                    record_file_read(&self.file_state, &path, modified);
-                }
             }
             let output = ToolOutput {
                 content: vec![ContentBlock::Text(TextContent::new(""))],
@@ -3406,12 +3502,6 @@ impl Tool for ReadTool {
                 "selectedTextWindow",
                 artifact_source,
             );
-        }
-
-        if let Some(meta) = &meta {
-            if let Ok(modified) = meta.modified() {
-                record_file_read(&self.file_state, &path, modified);
-            }
         }
 
         let output = ToolOutput {
@@ -9142,6 +9232,145 @@ mod tests {
             assert!(text.contains("beta"));
             assert!(text.contains("gamma"));
             assert!(!out.is_error);
+        });
+    }
+
+    #[test]
+    fn test_read_dedup_stub_warning_and_block() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("repeat.txt");
+            std::fs::write(&path, "alpha\nbeta\ngamma").unwrap();
+
+            let tool = ReadTool::new(tmp.path());
+            let read_once = |id: &'static str| {
+                let tool = &tool;
+                let path = path.clone();
+                async move {
+                    match tool
+                        .execute(
+                            id,
+                            serde_json::json!({ "path": path.to_string_lossy() }),
+                            None,
+                        )
+                        .await
+                        .unwrap()
+                    {
+                        ToolExecution::Done(o) => o,
+                        _ => panic!("expected Done"),
+                    }
+                }
+            };
+
+            let first = read_once("first").await;
+            assert!(!first.is_error);
+            assert!(get_text(&first.content).contains("alpha"));
+
+            let second = read_once("second").await;
+            assert!(!second.is_error);
+            assert!(get_text(&second.content).contains("unchanged since the previous read"));
+            assert_eq!(
+                second
+                    .details
+                    .as_ref()
+                    .and_then(|details| details.get("deduplicated"))
+                    .and_then(serde_json::Value::as_bool),
+                Some(true)
+            );
+
+            let third = read_once("third").await;
+            assert!(!third.is_error);
+            assert!(get_text(&third.content).contains("already been read repeatedly"));
+            assert!(
+                third
+                    .details
+                    .as_ref()
+                    .and_then(|details| details.get("_warning"))
+                    .is_some(),
+                "expected warning details"
+            );
+
+            let fourth = read_once("fourth").await;
+            assert!(fourth.is_error);
+            assert!(get_text(&fourth.content).contains("read blocked"));
+        });
+    }
+
+    #[test]
+    fn test_read_dedup_invalidates_after_write() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("invalidate.txt");
+            std::fs::write(&path, "before").unwrap();
+
+            let file_state = shared_file_tool_state();
+            let read = ReadTool::with_settings_and_state(
+                tmp.path(),
+                true,
+                false,
+                Arc::clone(&file_state),
+            );
+            let write = WriteTool::with_file_state(tmp.path(), Arc::clone(&file_state));
+
+            let first = match read
+                .execute(
+                    "read-1",
+                    serde_json::json!({ "path": path.to_string_lossy() }),
+                    None,
+                )
+                .await
+                .unwrap()
+            {
+                ToolExecution::Done(o) => o,
+                _ => panic!("expected Done"),
+            };
+            assert!(get_text(&first.content).contains("before"));
+
+            let duplicate = match read
+                .execute(
+                    "read-2",
+                    serde_json::json!({ "path": path.to_string_lossy() }),
+                    None,
+                )
+                .await
+                .unwrap()
+            {
+                ToolExecution::Done(o) => o,
+                _ => panic!("expected Done"),
+            };
+            assert!(get_text(&duplicate.content).contains("unchanged since"));
+
+            let written = match write
+                .execute(
+                    "write",
+                    serde_json::json!({
+                        "path": path.to_string_lossy(),
+                        "content": "after"
+                    }),
+                    None,
+                )
+                .await
+                .unwrap()
+            {
+                ToolExecution::Done(o) => o,
+                _ => panic!("expected Done"),
+            };
+            assert!(!written.is_error);
+
+            let fresh = match read
+                .execute(
+                    "read-3",
+                    serde_json::json!({ "path": path.to_string_lossy() }),
+                    None,
+                )
+                .await
+                .unwrap()
+            {
+                ToolExecution::Done(o) => o,
+                _ => panic!("expected Done"),
+            };
+            assert!(!fresh.is_error);
+            assert!(get_text(&fresh.content).contains("after"));
         });
     }
 
