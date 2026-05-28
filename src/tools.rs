@@ -1462,7 +1462,7 @@ impl Tool for ReadTool {
         "read"
     }
     fn description(&self) -> &str {
-        "Read the contents of a file. Supports text files and images (jpg, png, gif, webp). Images are sent as attachments. For text files, output is truncated to 2000 lines or 1MB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete."
+        "Read a file by path, scoped to the current working directory. Use this before edit/hashline_edit. Supports text files and images (jpg, png, gif, webp); images are returned as attachments. Text output is line-numbered and truncated to 2000 lines or 1MB, whichever is hit first. Use offset and limit to inspect a specific range, and continue with a later offset when you need more of a large file. Set hashline=true when you plan to use hashline_edit."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -1471,7 +1471,7 @@ impl Tool for ReadTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Path to the file to read (relative or absolute)"
+                    "description": "Path to the file to read. Relative paths resolve from cwd; absolute paths must remain inside cwd."
                 },
                 "offset": {
                     "type": "integer",
@@ -2348,7 +2348,7 @@ impl Tool for BashTool {
         "bash"
     }
     fn description(&self) -> &str {
-        "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 1MB (whichever is hit first). If truncated, full output is saved to a temp file. `timeout` defaults to 120 seconds; set `timeout: 0` to disable."
+        "Execute a bash command in the current working directory. Use dedicated tools (read, edit, write, grep, find, ls) when they fit; reserve bash for builds, tests, package commands, git commands, and shell-specific work. Quote paths with spaces, keep commands scoped to cwd, and avoid destructive actions unless explicitly authorized. Returns stdout and stderr. Output is truncated to the last 2000 lines or 1MB, whichever is hit first; if truncated, full output is saved to a temp file. timeout defaults to 120 seconds; set timeout=0 only for intentionally long-running commands."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -2357,7 +2357,7 @@ impl Tool for BashTool {
             "properties": {
                 "command": {
                     "type": "string",
-                    "description": "Bash command to execute"
+                    "description": "Bash command to execute in cwd. Quote paths with spaces and avoid destructive commands unless explicitly authorized."
                 },
                 "timeout": {
                     "type": "integer",
@@ -3013,7 +3013,7 @@ impl Tool for EditTool {
         "edit"
     }
     fn description(&self) -> &str {
-        "Edit a file by replacing text. The oldText must match a unique region; matching is exact but normalizes line endings, Unicode spaces/quotes/dashes, and ignores trailing whitespace."
+        "Edit an existing text file by replacing one unique region. Read the file first, then provide enough surrounding context in oldText to make the match unique. Prefer edit for targeted changes to existing files; use write only for new files or whole-file rewrites. Matching normalizes line endings, Unicode spaces/quotes/dashes, and trailing whitespace, but preserves the file's original line endings. Do not include line-number or hashline prefixes in oldText/newText."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -3022,12 +3022,12 @@ impl Tool for EditTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Path to the file to edit (relative or absolute)"
+                    "description": "Path to the file to edit. Relative paths resolve from cwd; absolute paths must remain inside cwd."
                 },
                 "oldText": {
                     "type": "string",
                     "minLength": 1,
-                    "description": "Text to find and replace (must match uniquely; matching normalizes line endings, Unicode spaces/quotes/dashes, and ignores trailing whitespace)"
+                    "description": "Existing text to replace. Include enough context for a unique match; omit line-number and hashline prefixes."
                 },
                 "newText": {
                     "type": "string",
@@ -3355,7 +3355,7 @@ impl Tool for WriteTool {
         "write"
     }
     fn description(&self) -> &str {
-        "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories."
+        "Write complete content to a file. Creates the file and parent directories if needed; overwrites the whole file if it already exists. Use this for new files or deliberate whole-file rewrites. For small edits to an existing file, prefer edit or hashline_edit so unrelated content stays untouched."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -3364,7 +3364,7 @@ impl Tool for WriteTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Path to the file to write (relative or absolute)"
+                    "description": "Path to write. Relative paths resolve from cwd; absolute paths must remain inside cwd."
                 },
                 "content": {
                     "type": "string",
@@ -3621,7 +3621,7 @@ impl Tool for GrepTool {
         "grep"
     }
     fn description(&self) -> &str {
-        "Search file contents for a pattern. Returns matching lines with file paths and line numbers. Respects .gitignore. Output is truncated to 100 matches or 1MB (whichever is hit first). Long lines are truncated to 500 chars. Use hashline=true to get N#AB content-hash tags for use with hashline_edit."
+        "Search file contents for a regex or literal pattern. Use grep to locate symbols, strings, errors, and call sites before reading entire files. Results include file paths, line numbers, and matching lines; .gitignore is respected. Use path and glob to narrow large searches. Output is truncated to 100 matches or 1MB, whichever is hit first; long lines are truncated to 500 chars. Set hashline=true when you want N#AB content-hash tags for hashline_edit."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -3630,7 +3630,7 @@ impl Tool for GrepTool {
             "properties": {
                 "pattern": {
                     "type": "string",
-                    "description": "Search pattern (regex or literal string)"
+                    "description": "Search pattern. Treated as a regex by default; set literal=true for exact text."
                 },
                 "path": {
                     "type": "string",
@@ -4117,7 +4117,7 @@ impl Tool for FindTool {
         "find"
     }
     fn description(&self) -> &str {
-        "Search for files by glob pattern. Returns matching file paths relative to the search directory. Sorted by modification time (newest first). Respects .gitignore. Output is truncated to 1000 results or 1MB (whichever is hit first)."
+        "Search for files by glob pattern. Use find when you need file names or paths rather than file contents. Returns paths relative to the search directory, sorted by modification time (newest first), and respects .gitignore. Narrow with path for large repositories. Output is truncated to 1000 results or 1MB, whichever is hit first."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -4130,7 +4130,7 @@ impl Tool for FindTool {
                 },
                 "path": {
                     "type": "string",
-                    "description": "Directory to search in (default: current directory)"
+                    "description": "Directory to search in (default: cwd). Relative paths resolve from cwd; absolute paths must remain inside cwd."
                 },
                 "limit": {
                     "type": "integer",
@@ -4465,7 +4465,7 @@ impl Tool for LsTool {
         "ls"
     }
     fn description(&self) -> &str {
-        "List directory contents. Returns entries sorted alphabetically, with '/' suffix for directories. Includes dotfiles. Output is truncated to 500 entries or 1MB (whichever is hit first)."
+        "List a directory's immediate contents. Use ls to inspect structure before choosing files to read or edit; use find for recursive glob searches. Returns entries sorted alphabetically, includes dotfiles, and adds '/' to directories. Output is truncated to 500 entries or 1MB, whichever is hit first."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -4474,7 +4474,7 @@ impl Tool for LsTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Directory to list (default: current directory)"
+                    "description": "Directory to list (default: cwd). Relative paths resolve from cwd; absolute paths must remain inside cwd."
                 },
                 "limit": {
                     "type": "integer",
@@ -5670,10 +5670,7 @@ impl Tool for HashlineEditTool {
         "hashline edit"
     }
     fn description(&self) -> &str {
-        "Apply precise file edits using LINE#HASH tags from a prior read with hashline=true. \
-         Each edit specifies an op (replace/prepend/append), a pos anchor (\"N#AB\"), an optional \
-         end anchor for range replace, and replacement lines. Edits are validated against current \
-         file hashes and applied bottom-up to avoid index invalidation."
+        "Apply precise text edits using LINE#HASH tags from a prior read or grep with hashline=true. Use this when exact-string edit is awkward because lines repeat, context is large, or multiple anchored edits are needed. Each edit specifies an op (replace/prepend/append), a pos anchor (\"N#AB\"), an optional end anchor for range replace, and replacement lines. Do not copy LINE#HASH prefixes into replacement content. Edits validate current file hashes before writing and apply bottom-up to avoid index invalidation; if validation fails, re-read with hashline=true."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -5682,7 +5679,7 @@ impl Tool for HashlineEditTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Path to the file to edit (relative or absolute)"
+                    "description": "Path to the file to edit. Relative paths resolve from cwd; absolute paths must remain inside cwd."
                 },
                 "edits": {
                     "type": "array",
@@ -6087,6 +6084,56 @@ mod tests {
     use proptest::prelude::*;
     #[cfg(target_os = "linux")]
     use std::time::Duration;
+
+    #[test]
+    fn test_builtin_tool_descriptions_carry_usage_guidance() {
+        let cwd = Path::new("/work");
+        let cases: [(&dyn Tool, &[&str]); 8] = [
+            (
+                &ReadTool::new(cwd),
+                &["Use this before edit/hashline_edit", "offset and limit", "hashline=true"],
+            ),
+            (
+                &BashTool::new(cwd),
+                &["Use dedicated tools", "Quote paths with spaces", "destructive actions"],
+            ),
+            (
+                &EditTool::new(cwd),
+                &["Read the file first", "unique", "Do not include line-number"],
+            ),
+            (
+                &WriteTool::new(cwd),
+                &["whole file", "prefer edit or hashline_edit"],
+            ),
+            (
+                &GrepTool::new(cwd),
+                &["locate symbols", "path and glob", "hashline=true"],
+            ),
+            (
+                &FindTool::new(cwd),
+                &["file names or paths", "Narrow with path"],
+            ),
+            (
+                &LsTool::new(cwd),
+                &["immediate contents", "use find for recursive"],
+            ),
+            (
+                &HashlineEditTool::new(cwd),
+                &["prior read or grep with hashline=true", "re-read with hashline=true"],
+            ),
+        ];
+
+        for (tool, expected) in cases {
+            let description = tool.description();
+            for needle in expected {
+                assert!(
+                    description.contains(needle),
+                    "{} description should contain {needle:?}: {description}",
+                    tool.name()
+                );
+            }
+        }
+    }
 
     #[test]
     fn test_truncate_head() {
