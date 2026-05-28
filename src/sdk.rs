@@ -53,7 +53,7 @@ pub use crate::provider::{
     Context as ProviderContext, InputType, Model, ModelCost, Provider, StreamOptions,
     ThinkingBudgets as ProviderThinkingBudgets, ToolDef,
 };
-pub use crate::session::Session;
+pub use crate::session::{Session, SessionEntry, SessionMessage};
 pub use crate::tools::{Tool, ToolExecution, ToolOutput, ToolRegistry, ToolUpdate};
 
 /// Stable alias for model-exposed tool schema definitions.
@@ -78,6 +78,35 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "ls",
     "hashline_edit",
 ];
+
+fn user_content_to_plain_text(content: &UserContent) -> String {
+    match content {
+        UserContent::Text(text) => text.clone(),
+        UserContent::Blocks(blocks) => {
+            let mut output = String::new();
+            for block in blocks {
+                match block {
+                    ContentBlock::Text(text) => {
+                        if !output.is_empty() {
+                            output.push('\n');
+                        }
+                        output.push_str(&text.text);
+                    }
+                    ContentBlock::Image(image) => {
+                        if !output.is_empty() {
+                            output.push('\n');
+                        }
+                        output.push_str("[image: ");
+                        output.push_str(&image.mime_type);
+                        output.push(']');
+                    }
+                    _ => {}
+                }
+            }
+            output
+        }
+    }
+}
 
 /// Create a read tool configured for `cwd`.
 pub fn create_read_tool(cwd: &Path) -> Box<dyn Tool> {
@@ -1475,6 +1504,102 @@ impl AgentSessionHandle {
             .await
             .map_err(|e| Error::session(e.to_string()))?;
         Ok(guard.to_messages_for_current_path())
+    }
+
+    /// Return user messages on the current path that can be used as
+    /// `/fork` targets.
+    pub async fn get_fork_messages(&self) -> Result<Vec<RpcForkMessage>> {
+        let cx = crate::agent_cx::AgentCx::for_request();
+        let mut guard = self
+            .session
+            .session
+            .lock(cx.cx())
+            .await
+            .map_err(|e| Error::session(e.to_string()))?;
+        guard.ensure_entry_ids();
+        let mut out = Vec::new();
+        for entry in guard.entries_for_current_path() {
+            let SessionEntry::Message(message_entry) = entry else {
+                continue;
+            };
+            let Some(entry_id) = message_entry.base.id.as_ref() else {
+                continue;
+            };
+            let SessionMessage::User { content, .. } = &message_entry.message else {
+                continue;
+            };
+            out.push(RpcForkMessage {
+                entry_id: entry_id.clone(),
+                text: user_content_to_plain_text(content),
+            });
+        }
+        Ok(out)
+    }
+
+    /// Fork the live session from a previous user message entry ID.
+    ///
+    /// The selected user message is removed from the installed fork and
+    /// returned to the caller so embedding UIs can pre-fill or resend it.
+    pub async fn fork(&mut self, entry_id: impl AsRef<str>) -> Result<RpcForkResult> {
+        let entry_id = entry_id.as_ref();
+        let cx = crate::agent_cx::AgentCx::for_request();
+        let save_enabled = self.session.save_enabled();
+        let (fork_plan, parent_path, session_dir, header_snapshot) = {
+            let guard = self
+                .session
+                .session
+                .lock(cx.cx())
+                .await
+                .map_err(|e| Error::session(e.to_string()))?;
+            let fork_plan = guard.plan_fork_from_user_message(entry_id)?;
+            let parent_path = guard.path.as_ref().map(|p| p.display().to_string());
+            let session_dir = guard.session_dir.clone();
+            let header_snapshot = guard.header.clone();
+            (fork_plan, parent_path, session_dir, header_snapshot)
+        };
+        let selected_text = fork_plan.selected_text.clone();
+
+        let mut new_session = if save_enabled {
+            Session::create_with_dir(session_dir)
+        } else {
+            Session::in_memory()
+        };
+        new_session.header.parent_session = parent_path;
+        new_session
+            .header
+            .provider
+            .clone_from(&header_snapshot.provider);
+        new_session
+            .header
+            .model_id
+            .clone_from(&header_snapshot.model_id);
+        new_session
+            .header
+            .thinking_level
+            .clone_from(&header_snapshot.thinking_level);
+        new_session.init_from_fork_plan(fork_plan);
+        if save_enabled {
+            new_session.save().await?;
+        }
+
+        let messages = new_session.to_messages_for_current_path();
+        let session_id = new_session.header.id.clone();
+        {
+            let mut guard = self
+                .session
+                .session
+                .lock(cx.cx())
+                .await
+                .map_err(|e| Error::session(e.to_string()))?;
+            *guard = new_session;
+        }
+        self.session.agent.replace_messages(messages);
+        self.session.agent.stream_options_mut().session_id = Some(session_id);
+
+        Ok(RpcForkResult {
+            text: selected_text,
+            cancelled: false,
+        })
     }
 
     /// Return a lightweight state snapshot.
