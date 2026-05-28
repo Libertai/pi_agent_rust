@@ -8573,7 +8573,8 @@ impl AgentSession {
         &mut self,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<()> {
-        self.compact_synchronous_force(Arc::new(on_event), None).await
+        self.compact_synchronous_force(Arc::new(on_event), None)
+            .await
     }
 
     /// Force-run compaction with user-supplied summarization notes.
