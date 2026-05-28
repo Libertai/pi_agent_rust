@@ -8561,7 +8561,7 @@ impl AgentSession {
         &mut self,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<()> {
-        self.compact_synchronous(Arc::new(on_event)).await
+        self.compact_synchronous(Arc::new(on_event), None).await
     }
 
     /// Force-mode peer of [`compact_now`]. Skips the
@@ -8573,7 +8573,17 @@ impl AgentSession {
         &mut self,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<()> {
-        self.compact_synchronous_force(Arc::new(on_event)).await
+        self.compact_synchronous_force(Arc::new(on_event), None).await
+    }
+
+    /// Force-run compaction with user-supplied summarization notes.
+    pub async fn compact_now_force_with_instructions(
+        &mut self,
+        custom_instructions: Option<&str>,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<()> {
+        self.compact_synchronous_force(Arc::new(on_event), custom_instructions)
+            .await
     }
 
     pub async fn execute_extension_command(
@@ -8893,8 +8903,13 @@ impl AgentSession {
     }
 
     /// Run compaction synchronously (inline), blocking until completion.
-    async fn compact_synchronous(&self, on_event: AgentEventHandler) -> Result<()> {
-        self.compact_synchronous_inner(on_event, false).await
+    async fn compact_synchronous(
+        &self,
+        on_event: AgentEventHandler,
+        custom_instructions: Option<&str>,
+    ) -> Result<()> {
+        self.compact_synchronous_inner(on_event, false, custom_instructions)
+            .await
     }
 
     /// Force-mode variant: same flow as [`compact_synchronous`] but
@@ -8903,14 +8918,20 @@ impl AgentSession {
     /// conversation is still well under the auto threshold. Returns
     /// `Ok(())` only when something was compacted; the caller can
     /// also rely on the emitted `AutoCompactionEnd` event.
-    async fn compact_synchronous_force(&self, on_event: AgentEventHandler) -> Result<()> {
-        self.compact_synchronous_inner(on_event, true).await
+    async fn compact_synchronous_force(
+        &self,
+        on_event: AgentEventHandler,
+        custom_instructions: Option<&str>,
+    ) -> Result<()> {
+        self.compact_synchronous_inner(on_event, true, custom_instructions)
+            .await
     }
 
     async fn compact_synchronous_inner(
         &self,
         on_event: AgentEventHandler,
         force: bool,
+        custom_instructions: Option<&str>,
     ) -> Result<()> {
         if !self.compaction_settings.enabled {
             return Ok(());
@@ -8946,7 +8967,9 @@ impl AgentSession {
                 reason: "threshold".to_string(),
             });
 
-            let before_outcome = self.dispatch_before_compact(&prep, &entries, None).await;
+            let before_outcome = self
+                .dispatch_before_compact(&prep, &entries, custom_instructions)
+                .await;
             if before_outcome.cancel {
                 on_event(AgentEvent::AutoCompactionEnd {
                     result: None,
@@ -8997,7 +9020,8 @@ impl AgentSession {
                 .clone()
                 .unwrap_or_default();
 
-            let compaction_result = compaction::compact(prep, provider, &credential, None).await;
+            let compaction_result =
+                compaction::compact(prep, provider, &credential, custom_instructions).await;
             self.extensions_is_compacting
                 .store(false, std::sync::atomic::Ordering::SeqCst);
 
