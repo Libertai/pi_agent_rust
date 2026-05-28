@@ -1664,6 +1664,18 @@ impl AgentSessionHandle {
         self.session.compact_now_force(on_event).await
     }
 
+    /// Force-mode compaction with additional user instructions for the
+    /// summarization prompt.
+    pub async fn compact_force_with_instructions(
+        &mut self,
+        custom_instructions: Option<&str>,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<()> {
+        self.session
+            .compact_now_force_with_instructions(custom_instructions, on_event)
+            .await
+    }
+
     /// Access the underlying `AgentSession`.
     pub const fn session(&self) -> &AgentSession {
         &self.session
