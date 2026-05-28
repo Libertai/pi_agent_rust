@@ -138,15 +138,15 @@ pub fn default_enabled_tools() -> Vec<&'static str> {
 #[must_use]
 pub fn builtin_one_liner(name: &str) -> Option<&'static str> {
     Some(match name {
-        "read" => "Read the contents of a file",
-        "write" => "Write content to a file",
-        "edit" => "Edit a file by replacing text",
+        "read" => "Read a file by path, scoped to the current working directory",
+        "write" => "Write complete content to a file",
+        "edit" => "Edit an existing text file by replacing one unique region",
         "bash" => "Execute a bash command in the current working directory",
-        "grep" => "Search file contents for a pattern",
+        "grep" => "Search file contents for a regex or literal pattern",
         "find" => "Search for files by glob pattern",
-        "ls" => "List directory contents",
+        "ls" => "List a directory's immediate contents",
         "hashline_edit" => {
-            "Apply precise file edits using LINE#HASH tags from a prior read with hashline=true"
+            "Apply precise text edits using LINE#HASH tags from a prior read or grep with hashline=true"
         }
         "web_search" => "Search the web",
         "ast_grep" => "Structural code search using tree-sitter AST patterns (ast-grep syntax)",
