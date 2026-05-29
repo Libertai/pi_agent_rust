@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use pi::tools::{EditTool, Tool};
+    use pi::tools::{EditTool, Tool, ToolExecution};
     use serde_json::json;
 
     #[test]
@@ -41,7 +41,10 @@ mod tests {
                 "newText": "fixed"
             });
 
-            let result = tool.execute("call_1", input, None).await.unwrap();
+            let result = match tool.execute("call_1", input, None).await.unwrap() {
+                ToolExecution::Done(output) => output,
+                ToolExecution::Paused { .. } => panic!("edit should not pause"),
+            };
             assert!(!result.is_error, "Tool execution failed: {result:?}");
 
             let new_content = std::fs::read_to_string(&file_path).unwrap();

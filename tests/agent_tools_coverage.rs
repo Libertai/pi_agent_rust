@@ -38,7 +38,8 @@ use pi::model::{
 use pi::provider::{Context, Provider, StreamOptions};
 use pi::session::Session;
 use pi::tools::{
-    Tool, ToolOutput, ToolRegistry, ToolUpdate, TruncatedBy, truncate_head, truncate_tail,
+    Tool, ToolExecution, ToolOutput, ToolRegistry, ToolUpdate, TruncatedBy, truncate_head,
+    truncate_tail,
 };
 use serde_json::json;
 use std::io::Write as _;
@@ -63,14 +64,27 @@ struct ToolExecResult {
 /// are turned into a ToolExecResult for easy assertion.
 async fn exec_tool(tool: &dyn Tool, call_id: &str, input: serde_json::Value) -> ToolExecResult {
     match tool.execute(call_id, input, None).await {
-        Ok(output) => ToolExecResult {
+        Ok(ToolExecution::Done(output)) => ToolExecResult {
             is_error: output.is_error,
             text: get_text(&output.content),
+        },
+        Ok(ToolExecution::Paused { kind, .. }) => ToolExecResult {
+            is_error: true,
+            text: format!("unexpected paused tool execution: {kind}"),
         },
         Err(e) => ToolExecResult {
             is_error: true,
             text: format!("{e}"),
         },
+    }
+}
+
+fn expect_done(execution: ToolExecution) -> ToolOutput {
+    match execution {
+        ToolExecution::Done(output) => output,
+        ToolExecution::Paused { kind, .. } => {
+            panic!("unexpected paused tool execution: {kind}")
+        }
     }
 }
 
@@ -543,7 +557,7 @@ fn tool_write_deeply_nested_dirs() {
             "path": deep_path.to_string_lossy(),
             "content": "deeply nested content"
         });
-        let result = tool.execute("write-deep-1", input, None).await.unwrap();
+        let result = expect_done(tool.execute("write-deep-1", input, None).await.unwrap());
 
         h.log().info_ctx("verify", "write deep dirs", |ctx| {
             ctx.push(("is_error".into(), result.is_error.to_string()));
@@ -975,7 +989,7 @@ impl Tool for FailingTool {
         _tool_call_id: &str,
         _input: serde_json::Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
-    ) -> std::result::Result<ToolOutput, pi::error::Error> {
+    ) -> std::result::Result<ToolExecution, pi::error::Error> {
         Err(pi::error::Error::tool(
             "failing_tool",
             "deliberate test failure",

@@ -737,6 +737,7 @@ fn rpc_get_session_stats_with_tool_calls() {
             content: vec![ContentBlock::Text(TextContent::new("file contents"))],
             details: None,
             is_error: false,
+            paused: None,
             timestamp: Some(now),
         });
         session.append_message(SessionMessage::Assistant {

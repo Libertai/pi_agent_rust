@@ -8,7 +8,7 @@ use crate::conformance::{
 use clap::error::ErrorKind;
 use pi::cli::{Cli, Commands, ExtensionCliFlag, parse_with_extension_flags};
 use pi::model::ContentBlock;
-use pi::tools::Tool;
+use pi::tools::{Tool, ToolExecution};
 use serde_json::{Value, json};
 use std::path::{Component, Path, PathBuf};
 use tempfile::TempDir;
@@ -93,7 +93,13 @@ async fn run_test_case(tool_name: &str, case: &TestCase) -> TestResult {
 
     // Check for unexpected errors
     let output = match result {
-        Ok(o) => o,
+        Ok(ToolExecution::Done(output)) => output,
+        Ok(ToolExecution::Paused { kind, .. }) => {
+            return TestResult::fail(
+                &case_name,
+                format!("Unexpected paused tool execution: {kind}"),
+            );
+        }
         Err(e) => {
             return TestResult::fail(&case_name, format!("Unexpected error: {e}"));
         }

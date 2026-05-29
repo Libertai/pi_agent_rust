@@ -8,7 +8,7 @@ mod common;
 
 use common::TestHarness;
 use pi::model::ContentBlock;
-use pi::tools::Tool;
+use pi::tools::{ToolExecution, ToolOutput, ToolUpdate};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
@@ -25,6 +25,34 @@ fn get_text(content: &[ContentBlock]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[async_trait::async_trait]
+trait TestToolExt {
+    async fn execute(
+        &self,
+        tool_call_id: &str,
+        input: serde_json::Value,
+        on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+    ) -> pi::PiResult<ToolOutput>;
+}
+
+#[async_trait::async_trait]
+impl<T: pi::tools::Tool + Sync + ?Sized> TestToolExt for T {
+    async fn execute(
+        &self,
+        tool_call_id: &str,
+        input: serde_json::Value,
+        on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+    ) -> pi::PiResult<ToolOutput> {
+        match pi::tools::Tool::execute(self, tool_call_id, input, on_update).await? {
+            ToolExecution::Done(output) => Ok(output),
+            ToolExecution::Paused { kind, .. } => Err(pi::Error::tool(
+                self.name().to_string(),
+                format!("unexpected paused tool execution in hardened tool test: {kind}"),
+            )),
+        }
+    }
 }
 
 fn rg_available() -> bool {

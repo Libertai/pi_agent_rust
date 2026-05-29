@@ -49,6 +49,15 @@ fn get_text_content(content: &[pi::model::ContentBlock]) -> String {
         .join("")
 }
 
+fn expect_done(execution: pi::tools::ToolExecution) -> pi::tools::ToolOutput {
+    match execution {
+        pi::tools::ToolExecution::Done(output) => output,
+        pi::tools::ToolExecution::Paused { kind, .. } => {
+            panic!("unexpected paused tool execution in error-handling test: {kind}")
+        }
+    }
+}
+
 #[test]
 fn dropin174_error_surface_logs_include_requirement_id() {
     let harness = TestHarness::new("dropin174_error_surface_logs_include_requirement_id");
@@ -1091,6 +1100,7 @@ mod tool_errors {
             let result = tool.execute("test-id", input, None).await;
             match result {
                 Ok(output) => {
+                    let output = expect_done(output);
                     let text = get_text_content(&output.content);
                     harness
                         .log()
@@ -1202,6 +1212,7 @@ mod tool_errors {
                     harness.log().info("verify", &msg);
                 }
                 Ok(output) => {
+                    let output = expect_done(output);
                     let text = get_text_content(&output.content);
                     harness
                         .log()
@@ -1254,6 +1265,7 @@ mod tool_errors {
                     harness.log().info("verify", &msg);
                 }
                 Ok(output) => {
+                    let output = expect_done(output);
                     let text = get_text_content(&output.content);
                     harness
                         .log()
@@ -1288,6 +1300,7 @@ mod tool_errors {
                     );
                 }
                 Ok(output) => {
+                    let output = expect_done(output);
                     let text = get_text_content(&output.content);
                     harness
                         .log()
