@@ -278,6 +278,7 @@ fn rpc_get_messages_preserves_tool_call_identity_and_args() {
             content: vec![ContentBlock::Text(TextContent::new("ok"))],
             details: None,
             is_error: false,
+            paused: None,
             timestamp: Some(now),
         });
 

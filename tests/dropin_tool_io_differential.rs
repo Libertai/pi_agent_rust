@@ -3,8 +3,8 @@
 use pi::model::ContentBlock;
 use pi::sse::SseParser;
 use pi::tools::{
-    BashTool, EditTool, FindTool, GrepTool, LsTool, ReadTool, Tool, ToolOutput, ToolUpdate,
-    WriteTool, truncate_head, truncate_tail,
+    BashTool, EditTool, FindTool, GrepTool, LsTool, ReadTool, Tool, ToolExecution, ToolOutput,
+    ToolUpdate, WriteTool, truncate_head, truncate_tail,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -57,8 +57,18 @@ fn assert_not_contains(haystack: &str, needle: &str, scenario_id: &str) {
     );
 }
 
+fn expect_done(tool_name: &str, execution: ToolExecution) -> pi::PiResult<ToolOutput> {
+    match execution {
+        ToolExecution::Done(output) => Ok(output),
+        ToolExecution::Paused { kind, .. } => Err(pi::Error::tool(
+            tool_name.to_string(),
+            format!("unexpected paused tool execution in G09 scenario: {kind}"),
+        )),
+    }
+}
+
 async fn execute<T: Tool + ?Sized>(tool: &T, input: Value) -> pi::PiResult<ToolOutput> {
-    tool.execute("g09-tool-io", input, None).await
+    expect_done(tool.name(), tool.execute("g09-tool-io", input, None).await?)
 }
 
 async fn execute_text<T: Tool + ?Sized>(tool: &T, input: Value) -> pi::PiResult<String> {
@@ -191,6 +201,7 @@ async fn run_scenario(scenario: &Scenario) -> pi::PiResult<()> {
                     Some(on_update),
                 )
                 .await?;
+            let output = expect_done("bash", output)?;
             assert_contains(&output_text(&output), "update-5", &scenario.id);
             assert!(
                 !updates.lock().expect("updates mutex").is_empty(),

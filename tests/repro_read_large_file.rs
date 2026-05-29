@@ -1,4 +1,4 @@
-use pi::tools::{ReadTool, Tool};
+use pi::tools::{ReadTool, Tool, ToolExecution};
 use serde_json::json;
 use std::io::Write;
 
@@ -31,7 +31,11 @@ fn test_read_large_file_offset() {
             .await
             .unwrap();
 
-        let content = match &result.content[0] {
+        let output = match result {
+            ToolExecution::Done(output) => output,
+            ToolExecution::Paused { .. } => panic!("read should not pause"),
+        };
+        let content = match &output.content[0] {
             pi::model::ContentBlock::Text(t) => t.text.clone(),
             _ => panic!("Expected text content"),
         };

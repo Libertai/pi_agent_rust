@@ -6,13 +6,41 @@
 mod common;
 
 use common::TestHarness;
-use pi::tools::Tool;
+use pi::tools::{ToolExecution, ToolOutput, ToolUpdate};
 use std::collections::BTreeMap;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+#[async_trait::async_trait]
+trait TestToolExt {
+    async fn execute(
+        &self,
+        tool_call_id: &str,
+        input: serde_json::Value,
+        on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+    ) -> pi::PiResult<ToolOutput>;
+}
+
+#[async_trait::async_trait]
+impl<T: pi::tools::Tool + Sync + ?Sized> TestToolExt for T {
+    async fn execute(
+        &self,
+        tool_call_id: &str,
+        input: serde_json::Value,
+        on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+    ) -> pi::PiResult<ToolOutput> {
+        match pi::tools::Tool::execute(self, tool_call_id, input, on_update).await? {
+            ToolExecution::Done(output) => Ok(output),
+            ToolExecution::Paused { kind, .. } => Err(pi::Error::tool(
+                self.name().to_string(),
+                format!("unexpected paused tool execution in conformance test: {kind}"),
+            )),
+        }
+    }
+}
 
 mod read_tool {
     use super::*;
@@ -2219,7 +2247,7 @@ fn normalize_tool_diagnostic_snapshot_is_invariant_to_noise() {
     );
 }
 
-async fn execute_tool_with_diagnostics<T: Tool + ?Sized>(
+async fn execute_tool_with_diagnostics<T: TestToolExt + ?Sized>(
     harness: &TestHarness,
     tool: &T,
     tool_name: &str,

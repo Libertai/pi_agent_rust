@@ -26,7 +26,7 @@ use pi::model::{
 };
 use pi::provider::{Context, Provider, StreamOptions};
 use pi::session::Session;
-use pi::tools::{Tool, ToolOutput, ToolRegistry, ToolUpdate};
+use pi::tools::{Tool, ToolExecution, ToolRegistry, ToolUpdate};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::io::Write as _;
@@ -673,7 +673,7 @@ impl Tool for FaultyPartialWriteTool {
         _tool_call_id: &str,
         input: serde_json::Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
-    ) -> Result<ToolOutput> {
+    ) -> Result<ToolExecution> {
         let input: FaultyWriteInput =
             serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
 
