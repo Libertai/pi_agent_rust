@@ -1177,6 +1177,8 @@ To avoid orphaned background jobs (e.g. `cmd &`), the bash script installs an `E
 
 This prevents the common failure mode where killing a shell leaves its children running.
 
+For intentionally long-running servers or watchers, pass `run_in_background: true` to the bash tool. Pi starts the command in its own process group, redirects stdout/stderr to a temp log, and returns immediately with the PID and log path instead of waiting for completion.
+
 ### Session Tree Structure
 
 Sessions use a tree structure rather than a flat list, enabling conversation branching (useful when exploring different approaches):
