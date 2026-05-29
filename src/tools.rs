@@ -2260,6 +2260,8 @@ impl Tool for ReadTool {
 struct BashInput {
     command: String,
     timeout: Option<u64>,
+    #[serde(default, alias = "run_in_background")]
+    run_in_background: bool,
 }
 
 pub struct BashTool {
@@ -2354,17 +2356,17 @@ pub(crate) async fn run_bash_command(
     // how callers inject `bwrap`/`firejail`/`sandbox-exec`/etc. without
     // pi knowing anything about those tools — pi just spawns whatever
     // argv it was handed.
-    let mut cmd = match command_wrapper.filter(|w| !w.is_empty()) {
-        Some(wrapper) => {
+    let mut cmd = command_wrapper.filter(|w| !w.is_empty()).map_or_else(
+        || Command::new(shell),
+        |wrapper| {
             let mut c = Command::new(&wrapper[0]);
             if wrapper.len() > 1 {
                 c.args(&wrapper[1..]);
             }
             c.arg(shell);
             c
-        }
-        None => Command::new(shell),
-    };
+        },
+    );
     cmd.arg("-c")
         .arg(&command)
         .current_dir(cwd)
@@ -2649,6 +2651,76 @@ pub(crate) async fn run_bash_command(
     })
 }
 
+fn start_bash_background_command(
+    cwd: &Path,
+    shell_path: Option<&str>,
+    command_prefix: Option<&str>,
+    command_wrapper: Option<&[String]>,
+    command: &str,
+) -> Result<(u32, PathBuf)> {
+    let command = command_prefix.filter(|p| !p.trim().is_empty()).map_or_else(
+        || command.to_string(),
+        |prefix| format!("{prefix}\n{command}"),
+    );
+
+    if !cwd.exists() {
+        return Err(Error::tool(
+            "bash",
+            format!(
+                "Working directory does not exist: {}\nCannot execute bash commands.",
+                cwd.display()
+            ),
+        ));
+    }
+
+    let shell = shell_path.unwrap_or_else(|| {
+        for path in ["/bin/bash", "/usr/bin/bash", "/usr/local/bin/bash"] {
+            if Path::new(path).exists() {
+                return path;
+            }
+        }
+        "sh"
+    });
+
+    let log_path = std::env::temp_dir().join(format!("pi-bash-bg-{}.log", Uuid::new_v4()));
+    let log = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&log_path)
+        .map_err(|e| Error::tool("bash", format!("Failed to create log file: {e}")))?;
+    let log_err = log
+        .try_clone()
+        .map_err(|e| Error::tool("bash", format!("Failed to clone log file: {e}")))?;
+
+    let mut cmd = command_wrapper.filter(|w| !w.is_empty()).map_or_else(
+        || Command::new(shell),
+        |wrapper| {
+            let mut c = Command::new(&wrapper[0]);
+            if wrapper.len() > 1 {
+                c.args(&wrapper[1..]);
+            }
+            c.arg(shell);
+            c
+        },
+    );
+    cmd.arg("-c")
+        .arg(&command)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(log_err));
+    isolate_command_process_group(&mut cmd);
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| Error::tool("bash", format!("Failed to spawn shell: {e}")))?;
+    let pid = child.id();
+    thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok((pid, log_path))
+}
+
 impl BashTool {
     pub fn new(cwd: &Path) -> Self {
         Self {
@@ -2694,7 +2766,7 @@ impl Tool for BashTool {
         "bash"
     }
     fn description(&self) -> &str {
-        "Execute a bash command in the current working directory. Use dedicated tools (read, edit, write, grep, find, ls) when they fit; reserve bash for builds, tests, package commands, git commands, and shell-specific work. Quote paths with spaces, keep commands scoped to cwd, and avoid destructive actions unless explicitly authorized. Returns stdout and stderr. Output is truncated to the last 2000 lines or 1MB, whichever is hit first; if truncated, full output is saved to a temp file. timeout defaults to 120 seconds; set timeout=0 only for intentionally long-running commands."
+        "Execute a bash command in the current working directory. Use dedicated tools (read, edit, write, grep, find, ls) when they fit; reserve bash for builds, tests, package commands, git commands, and shell-specific work. Quote paths with spaces, keep commands scoped to cwd, and avoid destructive actions unless explicitly authorized. Returns stdout and stderr. Output is truncated to the last 2000 lines or 1MB, whichever is hit first; if truncated, full output is saved to a temp file. timeout defaults to 120 seconds; set timeout=0 only for intentionally long-running foreground commands. Set run_in_background=true for long-running servers/watchers; the tool returns immediately with the process id and log path."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -2708,6 +2780,10 @@ impl Tool for BashTool {
                 "timeout": {
                     "type": "integer",
                     "description": "Timeout in seconds (default 120; set 0 to disable)"
+                },
+                "run_in_background": {
+                    "type": "boolean",
+                    "description": "Start the command and return immediately with pid and log path. Use for long-running servers or watchers."
                 }
             },
             "required": ["command"]
@@ -2723,6 +2799,29 @@ impl Tool for BashTool {
     ) -> Result<ToolExecution> {
         let input: BashInput =
             serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
+
+        if input.run_in_background {
+            let (pid, log_path) = start_bash_background_command(
+                &self.cwd,
+                self.shell_path.as_deref(),
+                self.command_prefix.as_deref(),
+                self.command_wrapper.as_deref(),
+                &input.command,
+            )?;
+            let log_path = log_path.display().to_string();
+            return Ok(ToolOutput {
+                content: vec![ContentBlock::Text(TextContent::new(format!(
+                    "Started background bash command.\nPID: {pid}\nOutput log: {log_path}"
+                )))],
+                details: Some(serde_json::json!({
+                    "background": true,
+                    "pid": pid,
+                    "fullOutputPath": log_path,
+                })),
+                is_error: false,
+            }
+            .into());
+        }
 
         let result = run_bash_command(
             &self.cwd,
@@ -7919,6 +8018,52 @@ keep NOT_A_SECRET=visible";
             let text = get_text(&out.content);
             assert!(text.contains("hello_from_bash"));
             assert!(!out.is_error);
+        });
+    }
+
+    #[test]
+    fn test_bash_run_in_background_returns_pid_and_log() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            let marker = tmp.path().join("marker.txt");
+            let tool = BashTool::new(tmp.path());
+            let out = match tool
+                .execute(
+                    "t",
+                    serde_json::json!({
+                        "command": "printf started; sleep 0.05; printf done > marker.txt",
+                        "run_in_background": true
+                    }),
+                    None,
+                )
+                .await
+                .unwrap()
+            {
+                ToolExecution::Done(o) => o,
+                _ => panic!("expected Done"),
+            };
+            let text = get_text(&out.content);
+            assert!(text.contains("Started background bash command"));
+            assert!(!out.is_error);
+            let details = out.details.as_ref().expect("details");
+            assert_eq!(
+                details.get("background").and_then(serde_json::Value::as_bool),
+                Some(true)
+            );
+            assert!(details.get("pid").and_then(serde_json::Value::as_u64).is_some());
+            let log_path = details
+                .get("fullOutputPath")
+                .and_then(serde_json::Value::as_str)
+                .expect("log path");
+            assert!(Path::new(log_path).is_file());
+
+            for _ in 0..40 {
+                if marker.is_file() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            assert_eq!(std::fs::read_to_string(marker).unwrap(), "done");
         });
     }
 
