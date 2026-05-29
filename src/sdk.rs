@@ -1253,6 +1253,26 @@ impl AgentSessionHandle {
         self.session.agent.resume_paused_tools(&session_arc).await
     }
 
+    /// Extend the live tool registry for this in-process session.
+    ///
+    /// Embedders use this when an external registry discovers new tools after
+    /// session creation. The next provider request will include the updated
+    /// tool definitions.
+    pub fn extend_tools<I>(&mut self, tools: I)
+    where
+        I: IntoIterator<Item = Box<dyn Tool>>,
+    {
+        self.session.agent.extend_tools(tools);
+    }
+
+    /// Rebuild tool definitions on the next provider request.
+    ///
+    /// This is useful when an existing tool's schema is backed by mutable
+    /// embedder state and changed without adding a new registry entry.
+    pub fn invalidate_tool_definitions(&mut self) {
+        self.session.agent.invalidate_tool_definitions();
+    }
+
     /// Send one user prompt through the agent loop.
     ///
     /// The `on_event` callback receives events for this prompt only.

@@ -1303,6 +1303,11 @@ impl Agent {
         self.cached_tool_defs = None; // Invalidate cache when tools change
     }
 
+    /// Force the next provider request to rebuild tool definitions from the registry.
+    pub fn invalidate_tool_definitions(&mut self) {
+        self.cached_tool_defs = None;
+    }
+
     /// Queue a steering message (delivered after tool completion).
     pub fn queue_steering(&mut self, message: Message) -> u64 {
         self.message_queue.push_steering(message)
