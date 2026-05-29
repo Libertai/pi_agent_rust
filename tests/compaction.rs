@@ -269,6 +269,7 @@ fn tool_result(tool_call_id: &str, tool_name: &str, content: &str) -> SessionMes
         content: vec![ContentBlock::Text(TextContent::new(content))],
         details: None,
         is_error: false,
+        paused: None,
         timestamp: Some(0),
     }
 }
@@ -1377,7 +1378,8 @@ fn to_messages_for_current_path_inserts_compaction_summary_before_kept_region() 
     assert!(!messages.is_empty());
 
     let first_text = model_message_text(&messages[0]);
-    assert!(first_text.contains("compacted into the following summary"));
+    assert!(first_text.contains("REFERENCE ONLY"));
+    assert!(first_text.contains("active task"));
     assert!(first_text.contains("<summary>"));
     assert!(first_text.contains("SUM"));
 
