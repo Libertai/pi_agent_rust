@@ -23,7 +23,7 @@ use pi::app::build_system_prompt;
 use pi::cli;
 use pi::model::ContentBlock;
 use pi::session::SESSION_VERSION;
-use pi::tools::{ReadTool, Tool};
+use pi::tools::{ReadTool, Tool, ToolExecution};
 use pi::vcr::{
     Cassette, Interaction, RecordedRequest, RecordedResponse, VCR_ENV_DIR, VCR_ENV_MODE,
 };
@@ -464,9 +464,14 @@ fn read_output_for_sample(cwd: &Path, path: &str) -> String {
     let tool = ReadTool::new(cwd);
     let path = path.to_string();
     let output = run_async(async move {
-        tool.execute("tool-call", json!({ "path": path }), None)
+        match tool
+            .execute("tool-call", json!({ "path": path }), None)
             .await
             .expect("read tool output")
+        {
+            ToolExecution::Done(output) => output,
+            ToolExecution::Paused { .. } => panic!("read should not pause"),
+        }
     });
     output
         .content

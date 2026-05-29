@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use pi::tools::{EditTool, Tool};
+    use pi::tools::{EditTool, Tool, ToolExecution, ToolOutput};
     use serde_json::json;
     use std::fs;
     use tempfile::tempdir;
@@ -14,6 +14,13 @@ mod tests {
                     "found LF without preceding CR at byte {idx}",
                 );
             }
+        }
+    }
+
+    fn expect_done(execution: ToolExecution) -> ToolOutput {
+        match execution {
+            ToolExecution::Done(output) => output,
+            ToolExecution::Paused { .. } => panic!("edit should not pause"),
         }
     }
 
@@ -31,8 +38,8 @@ mod tests {
             // Case 1: User tries to replace "foo" (no space) with "bar" (no space).
             // Expectation: Fuzzy match works, but ignores/skips trailing space in file.
             // Result: "bar " (space preserved).
-            let output = tool
-                .execute(
+            let output = expect_done(
+                tool.execute(
                     "call1",
                     json!({
                         "path": "fuzzy.txt",
@@ -42,7 +49,8 @@ mod tests {
                     None,
                 )
                 .await
-                .unwrap();
+                .unwrap(),
+            );
 
             assert!(!output.is_error);
             let content = fs::read_to_string(&file_path).unwrap();
@@ -51,8 +59,8 @@ mod tests {
             // Case 2: User tries to replace "bar " (with space) with "baz" (no space).
             // Expectation: Exact match works.
             // Result: "baz" (space deleted).
-            let output = tool
-                .execute(
+            let output = expect_done(
+                tool.execute(
                     "call2",
                     json!({
                         "path": "fuzzy.txt",
@@ -62,7 +70,8 @@ mod tests {
                     None,
                 )
                 .await
-                .unwrap();
+                .unwrap(),
+            );
 
             assert!(!output.is_error);
             let content = fs::read_to_string(&file_path).unwrap();
@@ -76,8 +85,8 @@ mod tests {
             // beginning of "baz  ", so edit replacement happens in exact mode first.
             // Result: "qux " (one trailing space remains).
 
-            let output = tool
-                .execute(
+            let output = expect_done(
+                tool.execute(
                     "call3",
                     json!({
                         "path": "fuzzy.txt",
@@ -87,7 +96,8 @@ mod tests {
                     None,
                 )
                 .await
-                .unwrap();
+                .unwrap(),
+            );
 
             assert!(!output.is_error);
             let content = fs::read_to_string(&file_path).unwrap();
@@ -105,8 +115,8 @@ mod tests {
 
             let tool = EditTool::new(tmp.path());
 
-            let output = tool
-                .execute(
+            let output = expect_done(
+                tool.execute(
                     "call_crlf_lf",
                     json!({
                         "path": "crlf.txt",
@@ -116,7 +126,8 @@ mod tests {
                     None,
                 )
                 .await
-                .unwrap();
+                .unwrap(),
+            );
             assert!(!output.is_error);
             let content_lf = fs::read_to_string(&file_path).unwrap();
             assert_eq!(content_lf, "alpha\r\nbravo\r\ncharlie\r\n");
@@ -124,8 +135,8 @@ mod tests {
 
             fs::write(&file_path, original).unwrap();
 
-            let output = tool
-                .execute(
+            let output = expect_done(
+                tool.execute(
                     "call_crlf_crlf",
                     json!({
                         "path": "crlf.txt",
@@ -135,7 +146,8 @@ mod tests {
                     None,
                 )
                 .await
-                .unwrap();
+                .unwrap(),
+            );
             assert!(!output.is_error);
             let content_crlf = fs::read_to_string(&file_path).unwrap();
             assert_eq!(content_crlf, "alpha\r\nbravo\r\ncharlie\r\n");

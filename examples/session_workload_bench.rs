@@ -239,6 +239,7 @@ fn append_tool_result(session: &mut Session, idx: usize, per_entry_tokens: usize
         )))],
         details: Some(json!({"ok": true, "idx": idx})),
         is_error: false,
+        paused: None,
         timestamp: Some(chrono::Utc::now().timestamp_millis()),
     });
 }
