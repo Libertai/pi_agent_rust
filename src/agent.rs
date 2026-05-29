@@ -622,6 +622,15 @@ impl Agent {
         self.cached_tool_defs = None; // Invalidate cache when tools change
     }
 
+    /// Keep only tools that satisfy `predicate`.
+    pub fn retain_tools<F>(&mut self, predicate: F)
+    where
+        F: FnMut(&dyn Tool) -> bool,
+    {
+        self.tools.retain(predicate);
+        self.cached_tool_defs = None;
+    }
+
     /// Force the next provider request to rebuild tool definitions from the registry.
     pub fn invalidate_tool_definitions(&mut self) {
         self.cached_tool_defs = None;
