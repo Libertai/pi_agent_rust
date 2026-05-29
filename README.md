@@ -42,7 +42,7 @@ You want an AI coding assistant in your terminal, but existing tools are:
 
 ## The Solution
 
-**pi_agent_rust** is a from-scratch Rust port of [Pi Agent](https://github.com/badlogic/pi) by [Mario Zechner](https://github.com/badlogic) (made with his blessing!). Single binary, instant startup, stable streaming, and 8 built-in tools.
+**pi_agent_rust** is a from-scratch Rust port of [Pi Agent](https://github.com/badlogic/pi) by [Mario Zechner](https://github.com/badlogic) (made with his blessing!). Single binary, instant startup, stable streaming, and built-in coding tools.
 
 Rather than a direct line-by-line translation, this port builds on two purpose-built Rust libraries:
 - **[asupersync](https://github.com/Dicklesworthstone/asupersync)**: A structured concurrency async runtime with built-in HTTP, TLS, and SQLite
@@ -1178,7 +1178,7 @@ To avoid orphaned background jobs (e.g. `cmd &`), the bash script installs an `E
 
 This prevents the common failure mode where killing a shell leaves its children running.
 
-For intentionally long-running servers or watchers, pass `run_in_background: true` to the bash tool. Pi starts the command in its own process group, redirects stdout/stderr to a temp log, and returns immediately with the PID and log path instead of waiting for completion.
+For intentionally long-running servers or watchers, pass `run_in_background: true` to the bash tool. Pi starts the command in its own process group, redirects stdout/stderr to a temp log, and returns immediately with the PID and log path instead of waiting for completion. Use `bash_output` with that log path to inspect trailing output, and `kill_bash` with the returned PID to terminate the background job.
 
 ### Session Tree Structure
 

@@ -300,6 +300,8 @@ fn default_system_prompt(enabled_tools: &[&str], package_dir: &Path) -> String {
     let tool_descriptions = [
         ("read", "Read file contents"),
         ("bash", "Execute bash commands (ls, grep, find, etc.)"),
+        ("bash_output", "Read output from a background bash command"),
+        ("kill_bash", "Terminate a background bash command"),
         (
             "edit",
             "Make surgical edits to files (find exact text and replace)",
@@ -321,6 +323,10 @@ fn default_system_prompt(enabled_tools: &[&str], package_dir: &Path) -> String {
     for tool in enabled_tools {
         if let Some((_, description)) = tool_descriptions.iter().find(|(name, _)| name == tool) {
             tools.push(format!("- {tool}: {description}"));
+        }
+        if *tool == "bash" {
+            tools.push("- bash_output: Read output from a background bash command".to_string());
+            tools.push("- kill_bash: Terminate a background bash command".to_string());
         }
     }
 
@@ -346,6 +352,11 @@ fn default_system_prompt(enabled_tools: &[&str], package_dir: &Path) -> String {
     } else if has_bash && (has_grep || has_find || has_ls) {
         guidelines_list.push(
             "Prefer grep/find/ls tools over bash for file exploration (faster, respects .gitignore)",
+        );
+    }
+    if has_bash {
+        guidelines_list.push(
+            "For long-running bash commands, set run_in_background=true, then use bash_output to inspect logs and kill_bash to stop the process",
         );
     }
 

@@ -1,6 +1,6 @@
 //! Built-in tool implementations.
 //!
-//! Pi provides 8 built-in tools: read, bash, edit, write, grep, find, ls, hashline_edit.
+//! Pi provides built-in tools: read, bash, bash_output, kill_bash, edit, write, grep, find, ls, hashline_edit.
 //!
 //! Tools are exposed to the model via JSON Schema (see [`crate::provider::ToolDef`]) and executed
 //! locally by the agent loop. Each tool returns structured [`ContentBlock`] output suitable for
@@ -1633,6 +1633,8 @@ impl ToolRegistry {
                         bash = bash.with_command_wrapper(wrapper);
                     }
                     tools.push(Box::new(bash));
+                    tools.push(Box::new(BashOutputTool));
+                    tools.push(Box::new(KillBashTool));
                 }
                 "edit" => tools.push(Box::new(EditTool::with_file_state(
                     cwd,
@@ -2272,6 +2274,22 @@ struct BashInput {
     run_in_background: bool,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BashOutputInput {
+    #[serde(alias = "log_path")]
+    log_path: String,
+    #[serde(default)]
+    pid: Option<u32>,
+    #[serde(default = "default_bash_output_lines")]
+    lines: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct KillBashInput {
+    pid: u32,
+}
+
 pub struct BashTool {
     cwd: PathBuf,
     shell_path: Option<String>,
@@ -2287,6 +2305,10 @@ pub struct BashTool {
     /// constructing an argv that does something useful.
     command_wrapper: Option<Vec<String>>,
 }
+
+pub struct BashOutputTool;
+
+pub struct KillBashTool;
 
 #[derive(Debug, Clone)]
 pub struct BashRunResult {
@@ -2729,6 +2751,41 @@ fn start_bash_background_command(
     Ok((pid, log_path))
 }
 
+const fn default_bash_output_lines() -> usize {
+    200
+}
+
+fn validated_background_log_path(path: &str) -> Result<PathBuf> {
+    let path = PathBuf::from(path);
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    let has_log_extension = Path::new(file_name)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("log"));
+    if !file_name.starts_with("pi-bash-bg-") || !has_log_extension {
+        return Err(Error::tool(
+            "bash_output",
+            "log_path must point to a pi background bash log returned by bash run_in_background",
+        ));
+    }
+    let temp_dir = std::env::temp_dir();
+    if !path.starts_with(&temp_dir) {
+        return Err(Error::tool(
+            "bash_output",
+            format!("log_path must stay under {}", temp_dir.display()),
+        ));
+    }
+    Ok(path)
+}
+
+fn process_is_running(pid: u32) -> bool {
+    let mut sys = sysinfo::System::new();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    sys.process(sysinfo::Pid::from_u32(pid)).is_some()
+}
+
 impl BashTool {
     pub fn new(cwd: &Path) -> Self {
         Self {
@@ -2866,6 +2923,176 @@ impl Tool for BashTool {
             details,
             is_error,
         }.into())
+    }
+}
+
+#[async_trait]
+#[allow(clippy::unnecessary_literal_bound)]
+impl Tool for BashOutputTool {
+    fn name(&self) -> &str {
+        "bash_output"
+    }
+
+    fn label(&self) -> &str {
+        "bash_output"
+    }
+
+    fn description(&self) -> &str {
+        "Read output from a background bash command started with bash run_in_background=true. Pass the log_path returned by bash, optionally with pid to report whether the process is still running."
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "log_path": {
+                    "type": "string",
+                    "description": "Output log path returned by bash when run_in_background=true"
+                },
+                "pid": {
+                    "type": "integer",
+                    "description": "Optional PID returned by bash; when supplied the result reports whether it is still running"
+                },
+                "lines": {
+                    "type": "integer",
+                    "description": "Number of trailing log lines to show (default 200)"
+                }
+            },
+            "required": ["log_path"]
+        })
+    }
+
+    fn is_read_only(&self) -> bool {
+        true
+    }
+
+    async fn execute(
+        &self,
+        _tool_call_id: &str,
+        input: serde_json::Value,
+        _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+    ) -> Result<ToolExecution> {
+        let input: BashOutputInput =
+            serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
+        let log_path = validated_background_log_path(&input.log_path)?;
+        let contents = std::fs::read_to_string(&log_path)
+            .map_err(|e| Error::tool("bash_output", format!("Failed to read log: {e}")))?;
+        let lines = input.lines.clamp(1, DEFAULT_MAX_LINES);
+        let mut truncation = truncate_tail(contents, lines, DEFAULT_MAX_BYTES);
+        let mut text = if truncation.content.is_empty() {
+            "(no output yet)".to_string()
+        } else {
+            std::mem::take(&mut truncation.content)
+        };
+        if truncation.truncated {
+            let start_line = truncation
+                .total_lines
+                .saturating_sub(truncation.output_lines)
+                .saturating_add(1);
+            let _ = write!(
+                text,
+                "\n\n[Showing last {} line{} from {}]",
+                truncation.output_lines,
+                if truncation.output_lines == 1 { "" } else { "s" },
+                log_path.display()
+            );
+            if start_line > 1 {
+                let _ = write!(text, " starting at line {start_line}");
+            }
+        }
+        let running = input.pid.map(process_is_running);
+        let status = match running {
+            Some(true) => "running",
+            Some(false) => "exited",
+            None => "unknown",
+        };
+        let mut details = serde_json::json!({
+            "logPath": log_path.display().to_string(),
+            "status": status,
+        });
+        if let Some(pid) = input.pid {
+            details["pid"] = serde_json::json!(pid);
+        }
+        if truncation.truncated {
+            details["truncation"] = serde_json::to_value(truncation)?;
+        }
+        Ok(ToolOutput {
+            content: vec![ContentBlock::Text(TextContent::new(format!(
+                "Background bash status: {status}\n{text}"
+            )))],
+            details: Some(details),
+            is_error: false,
+        }
+        .into())
+    }
+}
+
+#[async_trait]
+#[allow(clippy::unnecessary_literal_bound)]
+impl Tool for KillBashTool {
+    fn name(&self) -> &str {
+        "kill_bash"
+    }
+
+    fn label(&self) -> &str {
+        "kill_bash"
+    }
+
+    fn description(&self) -> &str {
+        "Terminate a background bash command started with bash run_in_background=true. Pass the PID returned by bash."
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "pid": {
+                    "type": "integer",
+                    "description": "PID returned by bash when run_in_background=true"
+                }
+            },
+            "required": ["pid"]
+        })
+    }
+
+    async fn execute(
+        &self,
+        _tool_call_id: &str,
+        input: serde_json::Value,
+        _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+    ) -> Result<ToolExecution> {
+        let input: KillBashInput =
+            serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
+        if !process_is_running(input.pid) {
+            return Ok(ToolOutput {
+                content: vec![ContentBlock::Text(TextContent::new(format!(
+                    "Background bash process {} is not running.",
+                    input.pid
+                )))],
+                details: Some(serde_json::json!({
+                    "pid": input.pid,
+                    "status": "not_running",
+                })),
+                is_error: false,
+            }
+            .into());
+        }
+        kill_process_group_tree(Some(input.pid));
+        std::thread::sleep(Duration::from_millis(50));
+        let running = process_is_running(input.pid);
+        Ok(ToolOutput {
+            content: vec![ContentBlock::Text(TextContent::new(if running {
+                format!("Sent kill signal to background bash process {}.", input.pid)
+            } else {
+                format!("Killed background bash process {}.", input.pid)
+            }))],
+            details: Some(serde_json::json!({
+                "pid": input.pid,
+                "status": if running { "kill_sent" } else { "killed" },
+            })),
+            is_error: false,
+        }
+        .into())
     }
 }
 
@@ -8072,6 +8299,118 @@ keep NOT_A_SECRET=visible";
                 std::thread::sleep(std::time::Duration::from_millis(25));
             }
             assert_eq!(std::fs::read_to_string(marker).unwrap(), "done");
+        });
+    }
+
+    #[test]
+    fn test_bash_output_reads_background_log() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            let bash = BashTool::new(tmp.path());
+            let out = match bash
+                .execute(
+                    "t",
+                    serde_json::json!({
+                        "command": "printf 'ready\\n'; sleep 0.2; printf 'done\\n'",
+                        "run_in_background": true
+                    }),
+                    None,
+                )
+                .await
+                .unwrap()
+            {
+                ToolExecution::Done(o) => o,
+                _ => panic!("expected Done"),
+            };
+            let details = out.details.as_ref().expect("details");
+            let pid = details
+                .get("pid")
+                .and_then(serde_json::Value::as_u64)
+                .expect("pid") as u32;
+            let log_path = details
+                .get("fullOutputPath")
+                .and_then(serde_json::Value::as_str)
+                .expect("log path");
+            for _ in 0..40 {
+                if std::fs::read_to_string(log_path)
+                    .unwrap_or_default()
+                    .contains("ready")
+                {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+
+            let tool = BashOutputTool;
+            let out = match tool
+                .execute(
+                    "t",
+                    serde_json::json!({
+                        "pid": pid,
+                        "log_path": log_path,
+                        "lines": 20
+                    }),
+                    None,
+                )
+                .await
+                .unwrap()
+            {
+                ToolExecution::Done(o) => o,
+                _ => panic!("expected Done"),
+            };
+            let text = get_text(&out.content);
+            assert!(text.contains("Background bash status:"));
+            assert!(text.contains("ready"));
+            assert!(!out.is_error);
+        });
+    }
+
+    #[test]
+    fn test_kill_bash_terminates_background_process() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            let bash = BashTool::new(tmp.path());
+            let out = match bash
+                .execute(
+                    "t",
+                    serde_json::json!({
+                        "command": "printf started; sleep 30",
+                        "run_in_background": true
+                    }),
+                    None,
+                )
+                .await
+                .unwrap()
+            {
+                ToolExecution::Done(o) => o,
+                _ => panic!("expected Done"),
+            };
+            let pid = out
+                .details
+                .as_ref()
+                .and_then(|details| details.get("pid"))
+                .and_then(serde_json::Value::as_u64)
+                .expect("pid") as u32;
+            assert!(process_is_running(pid));
+
+            let tool = KillBashTool;
+            let out = match tool
+                .execute("t", serde_json::json!({ "pid": pid }), None)
+                .await
+                .unwrap()
+            {
+                ToolExecution::Done(o) => o,
+                _ => panic!("expected Done"),
+            };
+            let text = get_text(&out.content);
+            assert!(text.contains(&pid.to_string()));
+            for _ in 0..20 {
+                if !process_is_running(pid) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            assert!(!process_is_running(pid));
         });
     }
 
