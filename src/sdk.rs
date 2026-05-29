@@ -1265,6 +1265,16 @@ impl AgentSessionHandle {
         self.session.agent.extend_tools(tools);
     }
 
+    /// Remove live tools by retaining only tools that satisfy `predicate`.
+    ///
+    /// The next provider request will include the updated tool list.
+    pub fn retain_tools<F>(&mut self, predicate: F)
+    where
+        F: FnMut(&dyn Tool) -> bool,
+    {
+        self.session.agent.retain_tools(predicate);
+    }
+
     /// Rebuild tool definitions on the next provider request.
     ///
     /// This is useful when an existing tool's schema is backed by mutable
@@ -3022,5 +3032,14 @@ mod tests {
         // Embedders can still fall back to the provider default explicitly.
         handle.set_max_tokens(None);
         assert_eq!(handle.max_tokens(), None);
+    }
+
+    #[test]
+    fn tool_registry_retain_removes_matching_tools() {
+        let tmp = tempdir().expect("tempdir");
+        let mut registry = ToolRegistry::new(&["read", "write"], tmp.path(), None);
+        registry.retain(|tool| tool.name() != "write");
+        assert!(registry.get("read").is_some());
+        assert!(registry.get("write").is_none());
     }
 }

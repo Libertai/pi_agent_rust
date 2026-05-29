@@ -3051,6 +3051,14 @@ impl ToolRegistry {
         self.tools.extend(tools);
     }
 
+    /// Keep only tools that satisfy `predicate`.
+    pub fn retain<F>(&mut self, mut predicate: F)
+    where
+        F: FnMut(&dyn Tool) -> bool,
+    {
+        self.tools.retain(|tool| predicate(tool.as_ref()));
+    }
+
     /// Get all tools.
     pub fn tools(&self) -> &[Box<dyn Tool>] {
         &self.tools
