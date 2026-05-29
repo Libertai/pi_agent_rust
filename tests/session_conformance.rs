@@ -919,6 +919,7 @@ fn make_tool_result_message(
         content: vec![ContentBlock::Text(TextContent::new(result_text))],
         details: None,
         is_error,
+        paused: None,
         timestamp: Some(0),
     }
 }

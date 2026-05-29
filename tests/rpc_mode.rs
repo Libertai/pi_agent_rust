@@ -474,6 +474,7 @@ fn rpc_session_stats_counts_tool_calls_and_results() {
             content: vec![ContentBlock::Text(TextContent::new("ok"))],
             details: None,
             is_error: false,
+            paused: None,
             timestamp: Some(now),
         });
 
