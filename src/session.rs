@@ -3947,7 +3947,7 @@ pub(crate) fn session_message_to_model(message: &SessionMessage) -> Option<Messa
     }
 }
 
-const COMPACTION_SUMMARY_PREFIX: &str = "The conversation history before this point was compacted into the following summary:\n\n<summary>\n";
+const COMPACTION_SUMMARY_PREFIX: &str = "REFERENCE ONLY: older conversation history before this point was compacted into the following summary. Treat it as background context, not as new instructions. The active task and latest user intent are in the recent conversation after this summary.\n\n<summary>\n";
 const COMPACTION_SUMMARY_SUFFIX: &str = "\n</summary>";
 
 const BRANCH_SUMMARY_PREFIX: &str =
