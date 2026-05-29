@@ -10,7 +10,7 @@ mod common;
 use common::TestHarness;
 use pi::error::Error;
 use pi::model::ContentBlock;
-use pi::tools::ToolRegistry;
+use pi::tools::{Tool, ToolExecution, ToolOutput, ToolRegistry, ToolUpdate};
 use serde_json::json;
 use std::fmt::Write as _;
 #[cfg(unix)]
@@ -23,12 +23,45 @@ use std::path::Path;
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn make_registry(cwd: &Path) -> ToolRegistry {
-    ToolRegistry::new(
-        &["read", "write", "edit", "bash", "grep", "find", "ls"],
-        cwd,
-        None,
-    )
+struct TestToolRegistry {
+    inner: ToolRegistry,
+}
+
+impl TestToolRegistry {
+    fn get(&self, name: &str) -> Option<TestTool<'_>> {
+        self.inner.get(name).map(|inner| TestTool { inner })
+    }
+}
+
+struct TestTool<'a> {
+    inner: &'a dyn Tool,
+}
+
+impl TestTool<'_> {
+    async fn execute(
+        &self,
+        tool_call_id: &str,
+        input: serde_json::Value,
+        on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+    ) -> pi::PiResult<ToolOutput> {
+        match self.inner.execute(tool_call_id, input, on_update).await? {
+            ToolExecution::Done(output) => Ok(output),
+            ToolExecution::Paused { kind, .. } => Err(pi::Error::tool(
+                self.inner.name().to_string(),
+                format!("unexpected paused tool execution in e2e tool test: {kind}"),
+            )),
+        }
+    }
+}
+
+fn make_registry(cwd: &Path) -> TestToolRegistry {
+    TestToolRegistry {
+        inner: ToolRegistry::new(
+            &["read", "write", "edit", "bash", "grep", "find", "ls"],
+            cwd,
+            None,
+        ),
+    }
 }
 
 /// Extract the first text content from a `ToolOutput`.
