@@ -382,6 +382,15 @@ pub struct SessionOptions {
     /// `--sandbox` flag, libertai-code-desktop's per-pillar policy) ship
     /// a sandbox argv without writing to the user's config file.
     pub bash_command_wrapper: Option<Vec<String>>,
+
+    /// Per-session auto-compaction enable override.
+    pub compaction_enabled: Option<bool>,
+
+    /// Per-session compaction reserve-token override.
+    pub compaction_reserve_tokens: Option<u32>,
+
+    /// Per-session compaction recent-context retention override.
+    pub compaction_keep_recent_tokens: Option<u32>,
 }
 
 impl Default for SessionOptions {
@@ -409,8 +418,32 @@ impl Default for SessionOptions {
             on_tool_end: None,
             on_stream_event: None,
             bash_command_wrapper: None,
+            compaction_enabled: None,
+            compaction_reserve_tokens: None,
+            compaction_keep_recent_tokens: None,
         }
     }
+}
+
+fn apply_compaction_overrides(config: &mut Config, options: &SessionOptions) {
+    if options.compaction_enabled.is_none()
+        && options.compaction_reserve_tokens.is_none()
+        && options.compaction_keep_recent_tokens.is_none()
+    {
+        return;
+    }
+
+    let mut compaction = config.compaction.clone().unwrap_or_default();
+    if let Some(enabled) = options.compaction_enabled {
+        compaction.enabled = Some(enabled);
+    }
+    if let Some(reserve_tokens) = options.compaction_reserve_tokens {
+        compaction.reserve_tokens = Some(reserve_tokens);
+    }
+    if let Some(keep_recent_tokens) = options.compaction_keep_recent_tokens {
+        compaction.keep_recent_tokens = Some(keep_recent_tokens);
+    }
+    config.compaction = Some(compaction);
 }
 
 /// Hook for assembling the session's [`ToolRegistry`].
@@ -1946,6 +1979,7 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
     if let Some(wrapper) = options.bash_command_wrapper.clone() {
         config.bash_command_wrapper = if wrapper.is_empty() { None } else { Some(wrapper) };
     }
+    apply_compaction_overrides(&mut config, &options);
 
     let mut auth = AuthStorage::load_async(Config::auth_path()).await?;
     auth.refresh_expired_oauth_tokens().await?;
@@ -2137,6 +2171,40 @@ mod tests {
             .build()
             .expect("build runtime");
         runtime.block_on(future)
+    }
+
+    #[test]
+    fn session_options_compaction_overrides_patch_loaded_config() {
+        let mut config = Config::default();
+        let options = SessionOptions {
+            compaction_enabled: Some(false),
+            compaction_reserve_tokens: Some(8192),
+            compaction_keep_recent_tokens: Some(12000),
+            ..SessionOptions::default()
+        };
+
+        apply_compaction_overrides(&mut config, &options);
+
+        assert!(!config.compaction_enabled());
+        assert_eq!(config.compaction_reserve_tokens(), 8192);
+        assert_eq!(config.compaction_keep_recent_tokens(), 12000);
+    }
+
+    #[test]
+    fn session_options_compaction_overrides_preserve_unset_values() {
+        let mut config: Config =
+            serde_json::from_str(r#"{"compaction":{"reserve_tokens":4096}}"#)
+                .expect("config");
+        let options = SessionOptions {
+            compaction_enabled: Some(false),
+            ..SessionOptions::default()
+        };
+
+        apply_compaction_overrides(&mut config, &options);
+
+        assert!(!config.compaction_enabled());
+        assert_eq!(config.compaction_reserve_tokens(), 4096);
+        assert_eq!(config.compaction_keep_recent_tokens(), 20000);
     }
 
     #[test]
