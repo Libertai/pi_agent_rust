@@ -33322,7 +33322,10 @@ mod tests {
                 .filter_map(Value::as_str)
                 .map(ToString::to_string)
                 .collect();
-            assert_eq!(tool_names, vec!["read", "bash", "edit"]);
+            assert_eq!(
+                tool_names,
+                vec!["read", "bash", "bash_output", "kill_bash", "edit"]
+            );
         });
     }
 
@@ -33392,7 +33395,7 @@ mod tests {
                 }
             };
             let tool_list = value.get("tools").and_then(Value::as_array).unwrap();
-            assert_eq!(tool_list.len(), 2);
+            assert_eq!(tool_list.len(), 4);
 
             let names: Vec<&str> = tool_list
                 .iter()
@@ -33400,6 +33403,8 @@ mod tests {
                 .collect();
             assert!(names.contains(&"read"));
             assert!(names.contains(&"bash"));
+            assert!(names.contains(&"bash_output"));
+            assert!(names.contains(&"kill_bash"));
 
             // Each tool should have a description
             for tool in tool_list {

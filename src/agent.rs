@@ -461,6 +461,7 @@ pub struct Agent {
 impl Agent {
     /// Create a new agent with the given provider and tools.
     pub fn new(provider: Arc<dyn Provider>, tools: ToolRegistry, config: AgentConfig) -> Self {
+        let tools = tools.with_native_task(Arc::clone(&provider), &config);
         Self {
             provider,
             tools,
@@ -594,6 +595,13 @@ impl Agent {
     /// Replace the provider implementation (used for model/provider switching).
     pub fn set_provider(&mut self, provider: Arc<dyn Provider>) {
         self.provider = provider;
+        self.refresh_native_task_tool();
+    }
+
+    fn refresh_native_task_tool(&mut self) {
+        self.tools
+            .install_native_task(Arc::clone(&self.provider), &self.config);
+        self.cached_tool_defs = None;
     }
 
     /// Register async fetchers for queued steering/follow-up messages.
@@ -682,6 +690,7 @@ impl Agent {
 
     pub fn set_system_prompt(&mut self, system_prompt: Option<String>) {
         self.config.system_prompt = system_prompt;
+        self.refresh_native_task_tool();
     }
 
     /// Build context for a completion request.
@@ -6351,6 +6360,7 @@ impl AgentSession {
                 let stream_options = self.agent.stream_options_mut();
                 stream_options.api_key = resolved_key; // ubs:ignore - not a hardcoded secret
                 stream_options.headers.clone_from(&entry.headers);
+                self.agent.refresh_native_task_tool();
                 Ok(())
             }
             Err(e) => Err(Error::validation(format!(

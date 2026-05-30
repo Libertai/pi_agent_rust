@@ -2504,7 +2504,7 @@ fn expected_anthropic_tools(enabled: &[&str]) -> Vec<serde_json::Value> {
     let config = Config::default();
     let tools = ToolRegistry::new(enabled, cwd, Some(&config));
 
-    tools
+    let mut defs = tools
         .tools()
         .iter()
         .map(|tool| {
@@ -2514,7 +2514,30 @@ fn expected_anthropic_tools(enabled: &[&str]) -> Vec<serde_json::Value> {
                 "input_schema": tool.parameters(),
             })
         })
-        .collect()
+        .collect::<Vec<_>>();
+
+    if enabled.contains(&"task") {
+        defs.push(json!({
+            "name": "task",
+            "description": "Run a bounded read-only child agent for focused research or summarization. The child agent can only read, grep, find, and ls.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "The focused task for the child agent to perform."
+                    },
+                    "subagent_type": {
+                        "type": "string",
+                        "description": "Optional routing hint for Claude Code-compatible callers."
+                    }
+                },
+                "required": ["prompt"]
+            }
+        }));
+    }
+
+    defs
 }
 
 fn log_tool_scenario_setup(
@@ -3318,6 +3341,7 @@ fn e2e_cli_default_tools_when_no_flag() {
         "find",
         "ls",
         "hashline_edit",
+        "task",
     ];
 
     let request_body = json!({
