@@ -233,13 +233,56 @@ impl TaskTool {
                 ..
             } if !delta.is_empty() => callback(ToolUpdate {
                 content: vec![ContentBlock::Text(TextContent::new(delta))],
-                details: Some(json!({ "source": "task" })),
+                details: Some(json!({
+                    "source": "task",
+                    "event": "message_update",
+                })),
             }),
-            AgentEvent::ToolExecutionStart { tool_name, .. } => callback(ToolUpdate {
+            AgentEvent::ToolExecutionStart {
+                tool_name,
+                tool_call_id,
+                ..
+            } => callback(ToolUpdate {
                 content: vec![ContentBlock::Text(TextContent::new(format!(
                     "[task tool: {tool_name}]\n"
                 )))],
-                details: Some(json!({ "source": "task", "tool": tool_name })),
+                details: Some(json!({
+                    "source": "task",
+                    "event": "tool_execution_start",
+                    "tool": tool_name,
+                    "toolCallId": tool_call_id,
+                })),
+            }),
+            AgentEvent::ToolExecutionUpdate {
+                tool_name,
+                tool_call_id,
+                partial_result,
+                ..
+            } => callback(ToolUpdate {
+                content: partial_result.content,
+                details: Some(json!({
+                    "source": "task",
+                    "event": "tool_execution_update",
+                    "tool": tool_name,
+                    "toolCallId": tool_call_id,
+                    "details": partial_result.details,
+                })),
+            }),
+            AgentEvent::ToolExecutionEnd {
+                tool_name,
+                tool_call_id,
+                result,
+                is_error,
+            } => callback(ToolUpdate {
+                content: result.content,
+                details: Some(json!({
+                    "source": "task",
+                    "event": "tool_execution_end",
+                    "tool": tool_name,
+                    "toolCallId": tool_call_id,
+                    "isError": is_error,
+                    "details": result.details,
+                })),
             }),
             _ => {}
         }
@@ -7484,6 +7527,64 @@ mod tests {
                 "child text deltas should be forwarded as task updates"
             );
         });
+    }
+
+    #[test]
+    fn test_task_tool_forwards_child_tool_updates() {
+        let updates: Arc<Mutex<Vec<ToolUpdate>>> = Arc::new(Mutex::new(Vec::new()));
+        let updates_for_callback = Arc::clone(&updates);
+        let callback: Arc<dyn Fn(ToolUpdate) + Send + Sync> = Arc::new(move |update| {
+            updates_for_callback.lock().unwrap().push(update);
+        });
+
+        TaskTool::emit_child_update(
+            AgentEvent::ToolExecutionUpdate {
+                tool_call_id: "child-read-1".to_string(),
+                tool_name: "read".to_string(),
+                args: json!({ "path": "README.md" }),
+                partial_result: ToolOutput {
+                    content: vec![ContentBlock::Text(TextContent::new("partial file"))],
+                    details: Some(json!({ "bytes": 12 })),
+                    is_error: false,
+                },
+            },
+            Some(&callback),
+        );
+        TaskTool::emit_child_update(
+            AgentEvent::ToolExecutionEnd {
+                tool_call_id: "child-read-1".to_string(),
+                tool_name: "read".to_string(),
+                result: ToolOutput {
+                    content: vec![ContentBlock::Text(TextContent::new("final file"))],
+                    details: Some(json!({ "bytes": 20 })),
+                    is_error: false,
+                },
+                is_error: false,
+            },
+            Some(&callback),
+        );
+
+        let updates = updates.lock().unwrap().clone();
+        assert_eq!(updates.len(), 2);
+        assert_eq!(get_text(&updates[0].content), "partial file");
+        assert_eq!(
+            updates[0].details.as_ref().unwrap()["event"],
+            "tool_execution_update"
+        );
+        assert_eq!(updates[0].details.as_ref().unwrap()["tool"], "read");
+        assert_eq!(
+            updates[0].details.as_ref().unwrap()["toolCallId"],
+            "child-read-1"
+        );
+        assert_eq!(updates[0].details.as_ref().unwrap()["details"]["bytes"], 12);
+
+        assert_eq!(get_text(&updates[1].content), "final file");
+        assert_eq!(
+            updates[1].details.as_ref().unwrap()["event"],
+            "tool_execution_end"
+        );
+        assert_eq!(updates[1].details.as_ref().unwrap()["isError"], false);
+        assert_eq!(updates[1].details.as_ref().unwrap()["details"]["bytes"], 20);
     }
 
     // ========================================================================
