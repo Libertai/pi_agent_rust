@@ -1,20 +1,25 @@
 //! Built-in tool implementations.
 //!
-//! Pi provides built-in tools: read, bash, bash_output, kill_bash, edit, write, grep, find, ls, hashline_edit.
+//! Pi provides built-in tools: read, bash, bash_output, kill_bash, edit, write, grep, find, ls, hashline_edit, task.
 //!
 //! Tools are exposed to the model via JSON Schema (see [`crate::provider::ToolDef`]) and executed
 //! locally by the agent loop. Each tool returns structured [`ContentBlock`] output suitable for
 //! rendering in the TUI and for inclusion in provider messages as tool results.
 
+use crate::agent::{Agent, AgentConfig, AgentEvent};
 use crate::agent_cx::AgentCx;
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::extensions::{safe_canonicalize, strip_unc_prefix};
-use crate::model::{ContentBlock, ImageContent, TextContent};
+use crate::model::{
+    AssistantMessage, AssistantMessageEvent, ContentBlock, ImageContent, TextContent,
+};
+use crate::provider::Provider;
 use asupersync::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf, SeekFrom};
 use asupersync::time::{sleep, wall_now};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use sha2::Digest as _;
 use std::cmp::Ordering;
 use std::collections::{HashMap, VecDeque};
@@ -249,6 +254,204 @@ const fn is_false(value: &bool) -> bool {
 pub struct ToolUpdate {
     pub content: Vec<ContentBlock>,
     pub details: Option<serde_json::Value>,
+}
+
+// ============================================================================
+// Task Tool
+// ============================================================================
+
+const TASK_READ_ONLY_TOOLS: [&str; 4] = ["read", "grep", "find", "ls"];
+
+/// Runs a bounded child agent for read-only research and summarization subtasks.
+struct TaskTool {
+    provider: Arc<dyn Provider>,
+    cwd: PathBuf,
+    config: Option<Config>,
+    agent_config: AgentConfig,
+}
+
+#[derive(Debug, Deserialize)]
+struct TaskToolInput {
+    prompt: Option<String>,
+    query: Option<String>,
+    task: Option<String>,
+    description: Option<String>,
+    #[serde(rename = "subagent_type")]
+    subagent_type: Option<String>,
+}
+
+impl TaskTool {
+    fn new(
+        provider: Arc<dyn Provider>,
+        cwd: PathBuf,
+        config: Option<Config>,
+        agent_config: AgentConfig,
+    ) -> Self {
+        Self {
+            provider,
+            cwd,
+            config,
+            agent_config,
+        }
+    }
+
+    fn child_config(&self, tool_call_id: &str) -> AgentConfig {
+        let mut config = self.agent_config.clone();
+        config.max_tool_iterations = config.max_tool_iterations.clamp(1, 12);
+        config.stream_options.session_id = Some(format!("task:{tool_call_id}"));
+
+        let child_instruction = concat!(
+            "You are a read-only child agent. Complete the requested subtask using only the ",
+            "available read/search/list tools. Do not ask for permission to modify files and do ",
+            "not attempt to write, edit, run shell commands, or spawn further child agents. ",
+            "Return a concise answer with concrete file references when relevant."
+        );
+
+        config.system_prompt = Some(match config.system_prompt {
+            Some(parent) if !parent.trim().is_empty() => {
+                format!("{parent}\n\n{child_instruction}")
+            }
+            _ => child_instruction.to_string(),
+        });
+        config
+    }
+
+    fn parse_prompt(input: TaskToolInput) -> Result<(String, Option<String>)> {
+        let prompt = input
+            .prompt
+            .or(input.query)
+            .or(input.task)
+            .or(input.description)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| Error::validation("task tool requires a non-empty prompt"))?;
+
+        Ok((prompt, input.subagent_type))
+    }
+
+    fn output_text(message: &AssistantMessage) -> String {
+        message
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    fn emit_child_update(
+        event: AgentEvent,
+        on_update: Option<&Arc<dyn Fn(ToolUpdate) + Send + Sync>>,
+    ) {
+        let Some(callback) = on_update else {
+            return;
+        };
+
+        match event {
+            AgentEvent::MessageUpdate {
+                assistant_message_event:
+                    AssistantMessageEvent::TextDelta { delta, .. }
+                    | AssistantMessageEvent::ThinkingDelta { delta, .. },
+                ..
+            } if !delta.is_empty() => callback(ToolUpdate {
+                content: vec![ContentBlock::Text(TextContent::new(delta))],
+                details: Some(json!({ "source": "task" })),
+            }),
+            AgentEvent::ToolExecutionStart { tool_name, .. } => callback(ToolUpdate {
+                content: vec![ContentBlock::Text(TextContent::new(format!(
+                    "[task tool: {tool_name}]\n"
+                )))],
+                details: Some(json!({ "source": "task", "tool": tool_name })),
+            }),
+            _ => {}
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for TaskTool {
+    fn name(&self) -> &'static str {
+        "task"
+    }
+
+    fn label(&self) -> &'static str {
+        "Task"
+    }
+
+    fn description(&self) -> &'static str {
+        "Run a bounded read-only child agent for focused research or summarization. The child agent can only read, grep, find, and ls."
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "prompt": {
+                    "type": "string",
+                    "description": "The focused task for the child agent to perform."
+                },
+                "subagent_type": {
+                    "type": "string",
+                    "description": "Optional routing hint for Claude Code-compatible callers."
+                }
+            },
+            "required": ["prompt"]
+        })
+    }
+
+    async fn execute(
+        &self,
+        tool_call_id: &str,
+        input: serde_json::Value,
+        on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+    ) -> Result<ToolExecution> {
+        let (prompt, subagent_type) =
+            Self::parse_prompt(serde_json::from_value::<TaskToolInput>(input)?)?;
+        let child_tools = ToolRegistry::new(&TASK_READ_ONLY_TOOLS, &self.cwd, self.config.as_ref());
+        let child_config = self.child_config(tool_call_id);
+        let mut child_agent = Agent::new(Arc::clone(&self.provider), child_tools, child_config);
+        let update_callback: Option<Arc<dyn Fn(ToolUpdate) + Send + Sync>> =
+            on_update.map(Arc::from);
+        let callback = update_callback.clone();
+
+        match child_agent
+            .run(prompt, move |event| {
+                Self::emit_child_update(event, callback.as_ref());
+            })
+            .await
+        {
+            Ok(message) => {
+                let mut text = Self::output_text(&message);
+                if text.trim().is_empty() {
+                    text = "(task completed with no text output)".to_string();
+                }
+                Ok(ToolOutput {
+                    content: vec![ContentBlock::Text(TextContent::new(text))],
+                    details: Some(json!({
+                        "tool": "task",
+                        "subagentType": subagent_type,
+                        "readOnlyTools": TASK_READ_ONLY_TOOLS,
+                    })),
+                    is_error: false,
+                }
+                .into())
+            }
+            Err(err) => Ok(ToolOutput {
+                content: vec![ContentBlock::Text(TextContent::new(format!(
+                    "Task failed: {err}"
+                )))],
+                details: Some(json!({
+                    "tool": "task",
+                    "subagentType": subagent_type,
+                    "readOnlyTools": TASK_READ_ONLY_TOOLS,
+                })),
+                is_error: true,
+            }
+            .into()),
+        }
+    }
 }
 
 // ============================================================================
@@ -2972,12 +3175,16 @@ pub(crate) fn resize_image_if_needed(
 /// - Enumerating tool schemas when building provider requests.
 pub struct ToolRegistry {
     tools: Vec<Box<dyn Tool>>,
+    cwd: Option<PathBuf>,
+    config: Option<Config>,
+    task_enabled: bool,
 }
 
 impl ToolRegistry {
     /// Create a new registry with the specified tools enabled.
     pub fn new(enabled: &[&str], cwd: &Path, config: Option<&Config>) -> Self {
         let mut tools: Vec<Box<dyn Tool>> = Vec::new();
+        let mut task_enabled = false;
         let shell_path = config.and_then(|c| c.shell_path.clone());
         let shell_command_prefix = config.and_then(|c| c.shell_command_prefix.clone());
         let bash_command_wrapper = config.and_then(|c| c.bash_command_wrapper.clone());
@@ -3023,21 +3230,62 @@ impl ToolRegistry {
                     cwd,
                     Arc::clone(&file_state),
                 ))),
+                "task" => {
+                    task_enabled = true;
+                }
                 _ => {}
             }
         }
 
-        Self { tools }
+        Self {
+            tools,
+            cwd: Some(cwd.to_path_buf()),
+            config: config.cloned(),
+            task_enabled,
+        }
     }
 
     /// Construct a registry from a pre-built tool list.
     pub fn from_tools(tools: Vec<Box<dyn Tool>>) -> Self {
-        Self { tools }
+        Self {
+            tools,
+            cwd: None,
+            config: None,
+            task_enabled: false,
+        }
     }
 
     /// Convert the registry into the owned tool list.
     pub fn into_tools(self) -> Vec<Box<dyn Tool>> {
         self.tools
+    }
+
+    pub(crate) fn with_native_task(
+        mut self,
+        provider: Arc<dyn Provider>,
+        agent_config: &AgentConfig,
+    ) -> Self {
+        self.install_native_task(provider, agent_config);
+        self
+    }
+
+    pub(crate) fn install_native_task(
+        &mut self,
+        provider: Arc<dyn Provider>,
+        agent_config: &AgentConfig,
+    ) {
+        if !self.task_enabled {
+            return;
+        }
+
+        self.tools.retain(|tool| tool.name() != "task");
+        let cwd = self.cwd.clone().unwrap_or_else(|| PathBuf::from("."));
+        self.tools.push(Box::new(TaskTool::new(
+            provider,
+            cwd,
+            self.config.clone(),
+            agent_config.clone(),
+        )));
     }
 
     /// Append a tool.
@@ -4446,8 +4694,8 @@ impl Tool for BashOutputTool {
         })
     }
 
-    fn is_read_only(&self) -> bool {
-        true
+    fn effects(&self) -> ToolEffects {
+        ToolEffects::read()
     }
 
     async fn execute(
@@ -8548,9 +8796,73 @@ impl Tool for HashlineEditTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use futures::Stream;
     use proptest::prelude::*;
+    use std::pin::Pin;
     #[cfg(target_os = "linux")]
     use std::time::Duration;
+
+    #[derive(Debug)]
+    struct TaskTestProvider;
+
+    #[async_trait]
+    impl Provider for TaskTestProvider {
+        fn name(&self) -> &'static str {
+            "test-provider"
+        }
+
+        fn api(&self) -> &'static str {
+            "test-api"
+        }
+
+        fn model_id(&self) -> &'static str {
+            "test-model"
+        }
+
+        async fn stream(
+            &self,
+            context: &crate::provider::Context<'_>,
+            _options: &crate::provider::StreamOptions,
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<crate::model::StreamEvent>> + Send>>> {
+            let tool_names = context
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(tool_names, TASK_READ_ONLY_TOOLS);
+
+            let partial = AssistantMessage {
+                api: "test-api".to_string(),
+                provider: "test-provider".to_string(),
+                model: "test-model".to_string(),
+                ..AssistantMessage::default()
+            };
+            let message = AssistantMessage {
+                content: vec![ContentBlock::Text(TextContent::new("child done"))],
+                api: "test-api".to_string(),
+                provider: "test-provider".to_string(),
+                model: "test-model".to_string(),
+                stop_reason: crate::model::StopReason::Stop,
+                ..AssistantMessage::default()
+            };
+            Ok(Box::pin(futures::stream::iter(vec![
+                Ok(crate::model::StreamEvent::Start { partial }),
+                Ok(crate::model::StreamEvent::TextDelta {
+                    content_index: 0,
+                    delta: "child ".to_string(),
+                }),
+                Ok(crate::model::StreamEvent::TextDelta {
+                    content_index: 0,
+                    delta: "done".to_string(),
+                }),
+                Ok(crate::model::StreamEvent::Done {
+                    reason: crate::model::StopReason::Stop,
+                    message,
+                }),
+            ])))
+        }
+    }
 
     fn wait_until_modified_after(path: &Path, previous: SystemTime) {
         for i in 0..20 {
@@ -8567,18 +8879,36 @@ mod tests {
     #[test]
     fn test_builtin_tool_descriptions_carry_usage_guidance() {
         let cwd = Path::new("/work");
-        let cases: [(&dyn Tool, &[&str]); 8] = [
+        let task = TaskTool::new(
+            Arc::new(TaskTestProvider),
+            cwd.to_path_buf(),
+            None,
+            AgentConfig::default(),
+        );
+        let cases: [(&dyn Tool, &[&str]); 9] = [
             (
                 &ReadTool::new(cwd),
-                &["Use this before edit/hashline_edit", "offset and limit", "hashline=true"],
+                &[
+                    "Use this before edit/hashline_edit",
+                    "offset and limit",
+                    "hashline=true",
+                ],
             ),
             (
                 &BashTool::new(cwd),
-                &["Use dedicated tools", "Quote paths with spaces", "destructive actions"],
+                &[
+                    "Use dedicated tools",
+                    "Quote paths with spaces",
+                    "destructive actions",
+                ],
             ),
             (
                 &EditTool::new(cwd),
-                &["Read the file first", "unique", "Do not include line-number"],
+                &[
+                    "Read the file first",
+                    "unique",
+                    "Do not include line-number",
+                ],
             ),
             (
                 &WriteTool::new(cwd),
@@ -8598,7 +8928,14 @@ mod tests {
             ),
             (
                 &HashlineEditTool::new(cwd),
-                &["prior read or grep with hashline=true", "re-read with hashline=true"],
+                &[
+                    "prior read or grep with hashline=true",
+                    "re-read with hashline=true",
+                ],
+            ),
+            (
+                &task,
+                &["read-only child agent", "read, grep, find, and ls"],
             ),
         ];
 
@@ -9694,6 +10031,59 @@ mod tests {
                 }
             })
             .collect::<String>()
+    }
+
+    #[test]
+    fn test_task_registry_attaches_after_provider_is_known() {
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = ToolRegistry::new(&["task"], tmp.path(), None);
+        assert!(registry.get("task").is_none());
+
+        let registry =
+            registry.with_native_task(Arc::new(TaskTestProvider), &AgentConfig::default());
+        assert!(registry.get("task").is_some());
+    }
+
+    #[test]
+    fn test_task_tool_runs_read_only_child_agent() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            let tool = TaskTool::new(
+                Arc::new(TaskTestProvider),
+                tmp.path().to_path_buf(),
+                None,
+                AgentConfig::default(),
+            );
+            let updates: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+            let updates_for_callback = Arc::clone(&updates);
+
+            let out = match tool
+                .execute(
+                    "task-1",
+                    json!({ "prompt": "summarize the workspace", "subagent_type": "general" }),
+                    Some(Box::new(move |update| {
+                        updates_for_callback
+                            .lock()
+                            .unwrap()
+                            .push(get_text(&update.content));
+                    })),
+                )
+                .await
+                .unwrap()
+            {
+                ToolExecution::Done(output) => output,
+                ToolExecution::Paused { .. } => panic!("expected Done"),
+            };
+
+            assert!(!out.is_error);
+            assert_eq!(get_text(&out.content), "child done");
+            assert_eq!(out.details.as_ref().unwrap()["subagentType"], "general");
+            assert_eq!(
+                updates.lock().unwrap().join(""),
+                "child done",
+                "child text deltas should be forwarded as task updates"
+            );
+        });
     }
 
     // ========================================================================

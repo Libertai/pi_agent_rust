@@ -413,11 +413,11 @@ pub struct Cli {
     #[arg(long)]
     pub no_tools: bool,
 
-    /// Specific tools to enable (comma-separated: read,write,edit,bash,grep,find,ls,hashline_edit).
+    /// Specific tools to enable (comma-separated: read,write,edit,bash,grep,find,ls,hashline_edit,task).
     /// Enabling bash also exposes bash_output and kill_bash for background jobs.
     #[arg(
         long,
-        default_value = "read,bash,edit,write,grep,find,ls,hashline_edit"
+        default_value = "read,bash,edit,write,grep,find,ls,hashline_edit,task"
     )]
     pub tools: String,
 
@@ -1037,6 +1037,7 @@ mod tests {
                 "find",
                 "ls",
                 "hashline_edit",
+                "task",
             ]
         );
     }
@@ -1384,7 +1385,10 @@ mod tests {
         assert!(cli.list_models.is_none());
         assert!(cli.command.is_none());
         assert!(cli.args.is_empty());
-        assert_eq!(cli.tools, "read,bash,edit,write,grep,find,ls,hashline_edit");
+        assert_eq!(
+            cli.tools,
+            "read,bash,edit,write,grep,find,ls,hashline_edit,task"
+        );
     }
 
     // ── 11. Combined flags ───────────────────────────────────────────
