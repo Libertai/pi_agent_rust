@@ -1688,3 +1688,32 @@ fn redact_cassette_header_case_insensitive() {
     let summary = pi::vcr::redact_cassette(&mut cassette);
     assert_eq!(summary.headers_redacted, 3);
 }
+
+#[test]
+fn default_system_prompt_honors_agent_name() {
+    let package_dir = Path::new("/tmp/nonexistent_package");
+    let prompt = app::default_system_prompt(&["read"], package_dir, "LibertAI Code", false);
+    assert!(
+        prompt.contains("operating inside LibertAI Code"),
+        "prompt should embed the agent_name; got prefix: {:?}",
+        &prompt[..prompt.find("Available tools").unwrap_or(80)]
+    );
+    assert!(
+        !prompt.contains("operating inside pi,"),
+        "prompt should not use the default 'pi' when a custom name is given"
+    );
+}
+
+#[test]
+fn default_system_prompt_hides_pi_docs_when_flag_set() {
+    let package_dir = Path::new("/tmp/nonexistent_package");
+    let prompt = app::default_system_prompt(&["read"], package_dir, "pi", true);
+    assert!(
+        !prompt.contains("Pi documentation"),
+        "Pi documentation block should be hidden when hide_pi_docs=true"
+    );
+    assert!(
+        !prompt.contains("pi packages"),
+        "pi packages line should be hidden when hide_pi_docs=true"
+    );
+}
