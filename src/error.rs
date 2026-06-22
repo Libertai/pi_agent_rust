@@ -877,7 +877,8 @@ impl From<asupersync::sync::LockError> for Error {
         match value {
             asupersync::sync::LockError::Cancelled => Self::Aborted,
             asupersync::sync::LockError::Poisoned
-            | asupersync::sync::LockError::PolledAfterCompletion => {
+            | asupersync::sync::LockError::PolledAfterCompletion
+            | asupersync::sync::LockError::TimedOut(_) => {
                 Self::session(value.to_string())
             }
         }
