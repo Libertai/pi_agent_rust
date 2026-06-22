@@ -170,7 +170,12 @@ pub fn build_system_prompt(
     };
 
     let mut prompt =
-        custom_prompt.unwrap_or_else(|| default_system_prompt(enabled_tools, package_dir));
+        custom_prompt.unwrap_or_else(|| default_system_prompt(
+        enabled_tools,
+        package_dir,
+        &std::env::var("PI_AGENT_NAME").unwrap_or_else(|_| "pi".to_string()),
+        std::env::var("PI_AGENT_HIDE_PI_DOCS").map(|v| v == "1").unwrap_or(false),
+    ));
 
     if let Some(append_prompt) = append_prompt {
         prompt.push_str("\n\n");
@@ -308,7 +313,12 @@ fn resolve_prompt_input(input: Option<&str>, description: &str) -> Result<Option
     }
 }
 
-fn default_system_prompt(enabled_tools: &[&str], package_dir: &Path) -> String {
+pub fn default_system_prompt(
+    enabled_tools: &[&str],
+    package_dir: &Path,
+    agent_name: &str,
+    hide_pi_docs: bool,
+) -> String {
     let tool_descriptions = [
         ("read", "Read file contents"),
         ("bash", "Execute bash commands (ls, grep, find, etc.)"),
@@ -407,9 +417,15 @@ fn default_system_prompt(enabled_tools: &[&str], package_dir: &Path) -> String {
     let docs_path = package_dir.join("docs").display().to_string();
     let examples_path = package_dir.join("examples").display().to_string();
 
-    format!(
-        "You are an expert coding assistant operating inside pi, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.\n\nAvailable tools:\n{tools_list}\n\nIn addition to the tools above, you may have access to other custom tools depending on the project.\n\nGuidelines:\n{guidelines}\n\nPi documentation (read only when the user asks about pi itself, its SDK, extensions, themes, skills, or TUI):\n- Main documentation: {readme_path}\n- Additional docs: {docs_path}\n- Examples: {examples_path} (extensions, custom tools, SDK)\n- When asked about: extensions (docs/extensions.md, examples/extensions/), themes (docs/themes.md), skills (docs/skills.md), prompt templates (docs/prompt-templates.md), TUI components (docs/tui.md), keybindings (docs/keybindings.md), SDK integrations (docs/sdk.md), custom providers (docs/custom-provider.md), adding models (docs/models.md), pi packages (docs/packages.md)\n- When working on pi topics, read the docs and examples, and follow .md cross-references before implementing\n- Always read pi .md files completely and follow links to related docs (e.g., tui.md for TUI API details)"
-    )
+    let prompt = format!(
+        "You are an expert coding assistant operating inside {agent_name}, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.\n\nAvailable tools:\n{tools_list}\n\nIn addition to the tools above, you may have access to other custom tools depending on the project.\n\nGuidelines:\n{guidelines}\n\nPi documentation (read only when the user asks about pi itself, its SDK, extensions, themes, skills, or TUI):\n- Main documentation: {readme_path}\n- Additional docs: {docs_path}\n- Examples: {examples_path} (extensions, custom tools, SDK)\n- When asked about: extensions (docs/extensions.md, examples/extensions/), themes (docs/themes.md), skills (docs/skills.md), prompt templates (docs/prompt-templates.md), TUI components (docs/tui.md), keybindings (docs/keybindings.md), SDK integrations (docs/sdk.md), custom providers (docs/custom-provider.md), adding models (docs/models.md), pi packages (docs/packages.md)\n- When working on pi topics, read the docs and examples, and follow .md cross-references before implementing\n- Always read pi .md files completely and follow links to related docs (e.g., tui.md for TUI API details)"
+    );
+    if hide_pi_docs {
+        if let Some(idx) = prompt.find("\n\nPi documentation") {
+            return prompt[..idx].to_string();
+        }
+    }
+    prompt
 }
 
 fn load_project_context_files(cwd: &Path, global_dir: &Path) -> Vec<ContextFile> {
