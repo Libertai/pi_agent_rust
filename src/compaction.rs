@@ -348,6 +348,28 @@ struct ContextUsageEstimate {
     last_usage_index: Option<usize>,
 }
 
+/// Estimate the live context-token count for a slice of session entries.
+///
+/// This is the post-compaction counterpart to the `tokens_before` computed
+/// inside [`prepare_compaction_inner`]: it maps each entry to its
+/// [`SessionMessage`] (via [`message_from_entry`]) and runs the same
+/// [`estimate_context_tokens`] estimator. Exposed (pub) so the agent layer
+/// can report `tokensAfter` in the `AutoCompactionEnd` payload without
+/// duplicating the estimator — see `auto_compaction_result_payload`.
+///
+/// Takes `&[&SessionEntry]` to match [`Session::entries_for_current_path`]'s
+/// borrowed return (no clone needed at the call site).
+///
+/// Returns `0` when no entries map to messages (e.g. an empty session),
+/// which is the correct "nothing to count" answer rather than a sentinel.
+pub fn estimate_context_tokens_for_entries(entries: &[&SessionEntry]) -> u64 {
+    let messages: Vec<SessionMessage> = entries
+        .iter()
+        .filter_map(|e| message_from_entry(e))
+        .collect();
+    estimate_context_tokens(&messages).tokens
+}
+
 fn estimate_context_tokens(messages: &[SessionMessage]) -> ContextUsageEstimate {
     let mut last_usage: Option<(&Usage, usize)> = None;
     for (idx, msg) in messages.iter().enumerate().rev() {
@@ -1941,6 +1963,49 @@ mod tests {
         assert!(!cuts.contains(&0));
         assert!(cuts.contains(&1));
         assert!(!cuts.contains(&2));
+    }
+
+    // ── estimate_context_tokens_for_entries (P3: tokensAfter) ────────
+
+    #[test]
+    fn estimate_context_tokens_for_entries_empty_is_zero() {
+        let entries: Vec<SessionEntry> = vec![];
+        let refs: Vec<&SessionEntry> = entries.iter().collect();
+        assert_eq!(estimate_context_tokens_for_entries(&refs), 0);
+    }
+
+    #[test]
+    fn estimate_context_tokens_for_entries_user_only_matches_messages() {
+        // Same estimate as estimate_context_tokens over the mapped messages:
+        // two user texts "hello" + "world" => ceil(5/3)+ceil(5/3) = 2+2 = 4.
+        let entries = vec![user_entry("1", "hello"), user_entry("2", "world")];
+        let refs: Vec<&SessionEntry> = entries.iter().collect();
+        assert_eq!(estimate_context_tokens_for_entries(&refs), 4);
+    }
+
+    #[test]
+    fn estimate_context_tokens_for_entries_uses_assistant_usage() {
+        // Last assistant usage input=50, output=10 => 60; trailing "bye" = 1.
+        let entries = vec![
+            user_entry("1", "hi"),
+            assistant_entry("2", "hello", 50, 10),
+            user_entry("3", "bye"),
+        ];
+        let refs: Vec<&SessionEntry> = entries.iter().collect();
+        assert_eq!(estimate_context_tokens_for_entries(&refs), 61);
+    }
+
+    #[test]
+    fn estimate_context_tokens_for_entries_post_compaction_summary_only() {
+        // After a compaction the history is a single Compaction summary entry.
+        // message_from_entry maps a Compaction entry to its summary text, so
+        // the estimate is the summary's heuristic token count (not 0) — this
+        // is the "tokensAfter" shape right after apply_compaction_entry.
+        let entries = vec![compact_entry("1", "compact summary", 100)];
+        let refs: Vec<&SessionEntry> = entries.iter().collect();
+        // "compact summary" is 15 chars => ceil(15/3) = 5 (heuristic, no
+        // assistant usage in a compaction-only history).
+        assert_eq!(estimate_context_tokens_for_entries(&refs), 5);
     }
 
     // ── find_turn_start_index ───────────────────────────────────────
