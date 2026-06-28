@@ -1386,6 +1386,7 @@ fn handle_session_new(
         enabled: options.config.compaction_enabled(),
         reserve_tokens: options.config.compaction_reserve_tokens(),
         keep_recent_tokens: options.config.compaction_keep_recent_tokens(),
+        token_budget_compact: options.config.compaction_token_budget_compact(),
         context_window_tokens: if model_entry.model.context_window == 0 {
             ResolvedCompactionSettings::default().context_window_tokens
         } else {

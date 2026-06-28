@@ -391,6 +391,14 @@ pub struct SessionOptions {
 
     /// Per-session compaction recent-context retention override.
     pub compaction_keep_recent_tokens: Option<u32>,
+
+    /// (P2 / #37) Per-session token-budget compaction fast-path override.
+    /// When `Some(true)`, compaction skips the LLM summarisation round-trip
+    /// and keeps a budget-bounded verbatim transcript of the most-recent
+    /// messages (see `compaction::budget_summary`). `None` defers to the
+    /// config-file setting (`Config::compaction_token_budget_compact`),
+    /// which defaults to `false` (LLM summarisation).
+    pub compaction_token_budget_compact: Option<bool>,
 }
 
 impl Default for SessionOptions {
@@ -421,6 +429,7 @@ impl Default for SessionOptions {
             compaction_enabled: None,
             compaction_reserve_tokens: None,
             compaction_keep_recent_tokens: None,
+            compaction_token_budget_compact: None,
         }
     }
 }
@@ -429,6 +438,7 @@ fn apply_compaction_overrides(config: &mut Config, options: &SessionOptions) {
     if options.compaction_enabled.is_none()
         && options.compaction_reserve_tokens.is_none()
         && options.compaction_keep_recent_tokens.is_none()
+        && options.compaction_token_budget_compact.is_none()
     {
         return;
     }
@@ -442,6 +452,9 @@ fn apply_compaction_overrides(config: &mut Config, options: &SessionOptions) {
     }
     if let Some(keep_recent_tokens) = options.compaction_keep_recent_tokens {
         compaction.keep_recent_tokens = Some(keep_recent_tokens);
+    }
+    if let Some(token_budget_compact) = options.compaction_token_budget_compact {
+        compaction.token_budget_compact = Some(token_budget_compact);
     }
     config.compaction = Some(compaction);
 }
@@ -2080,6 +2093,7 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
         enabled: config.compaction_enabled(),
         reserve_tokens: config.compaction_reserve_tokens(),
         keep_recent_tokens: config.compaction_keep_recent_tokens(),
+        token_budget_compact: config.compaction_token_budget_compact(),
         context_window_tokens,
     };
 
