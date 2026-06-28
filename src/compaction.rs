@@ -64,6 +64,16 @@ pub struct ResolvedCompactionSettings {
     pub context_window_tokens: u32,
     pub reserve_tokens: u32,
     pub keep_recent_tokens: u32,
+    /// (P2 / #37) Token-budget compaction fast path. When `true`, `compact`
+    /// skips the LLM summarisation round-trip and instead produces a
+    /// budget-bounded verbatim transcript of the most-recent
+    /// `messages_to_summarize` (kept most-recent-first within
+    /// `reserve_tokens`), prefixed with a "history truncated" header. This
+    /// mirrors Codex's `compact_token_budget.rs` intent: a latency + cost
+    /// win when a semantic summary isn't worth a full model round-trip (e.g.
+    /// short, mechanical sessions). The default `false` preserves the
+    /// existing LLM-summarisation behaviour.
+    pub token_budget_compact: bool,
 }
 
 impl Default for ResolvedCompactionSettings {
@@ -84,6 +94,8 @@ impl Default for ResolvedCompactionSettings {
             reserve_tokens: 10_240,
             // 10% of context window
             keep_recent_tokens: 12_800,
+            // LLM summarisation is the default; the budget fast-path is opt-in.
+            token_budget_compact: false,
         }
     }
 }
@@ -177,6 +189,10 @@ fn compaction_settings_to_value(settings: &ResolvedCompactionSettings) -> Value 
     obj.insert(
         "keepRecentTokens".to_string(),
         Value::from(settings.keep_recent_tokens),
+    );
+    obj.insert(
+        "tokenBudgetCompact".to_string(),
+        Value::Bool(settings.token_budget_compact),
     );
     Value::Object(obj)
 }
@@ -1234,13 +1250,73 @@ pub async fn summarize_entries(
     Ok(Some(summary))
 }
 
+/// (P2 / #37) The token-budget fast-path summary: a budget-bounded verbatim
+/// transcript of the most-recent `messages_to_summarize`, prefixed with a
+/// "history truncated" header. Skips the LLM summarisation round-trip
+/// entirely (the latency + cost win), at the cost of a less-semantic
+/// summary — the most-recent messages are kept verbatim (most relevant to
+/// the ongoing turn), oldest messages dropped first, until the running
+/// token cost fits within `reserve_tokens`.
+///
+/// Used by [`compact`] when `ResolvedCompactionSettings::token_budget_compact`
+/// is `true`. Pure (no I/O) so it's unit-testable in isolation.
+fn budget_summary(messages_to_summarize: &[SessionMessage], settings: &ResolvedCompactionSettings) -> String {
+    // Walk most-recent-first, accumulating the token cost of each message;
+    // keep a message only if adding it still fits the budget. reserve_tokens
+    // is the same budget the LLM path's summary targets, so the two paths are
+    // comparable in post-compaction size.
+    let budget = u64::from(settings.reserve_tokens);
+    let mut kept: Vec<&SessionMessage> = Vec::new();
+    let mut running = 0u64;
+    for msg in messages_to_summarize.iter().rev() {
+        let cost = estimate_tokens(msg);
+        if running.saturating_add(cost) > budget && !kept.is_empty() {
+            break;
+        }
+        running = running.saturating_add(cost);
+        kept.push(msg);
+    }
+    kept.reverse(); // back to chronological order for the transcript
+
+    let mut out = String::from(
+        "_Conversation history truncated to fit the token budget \
+         (token-budget fast path; no LLM summary). Most-recent messages kept \
+         verbatim, oldest dropped._\n\n",
+    );
+    let llm_messages: Vec<Message> = kept
+        .iter()
+        .filter_map(|m| session_message_to_model(m))
+        .collect();
+    out.push_str(&serialize_conversation(&llm_messages));
+    out
+}
+
 pub async fn compact(
     preparation: CompactionPreparation,
     provider: Arc<dyn Provider>,
     api_key: &str,
     custom_instructions: Option<&str>,
 ) -> Result<CompactionResult> {
-    let summary = if preparation.is_split_turn && !preparation.turn_prefix_messages.is_empty() {
+    // (P2 / #37) Token-budget fast path: skip the LLM summarisation
+    // round-trip entirely and build a budget-bounded verbatim transcript.
+    // `provider`/`api_key`/`custom_instructions` are unused on this path —
+    // keep them in the signature so callers don't branch on the mode.
+    let summary = if preparation.settings.token_budget_compact {
+        if preparation.is_split_turn && !preparation.turn_prefix_messages.is_empty() {
+            let history_summary = if preparation.messages_to_summarize.is_empty() {
+                "No prior history.".to_string()
+            } else {
+                budget_summary(&preparation.messages_to_summarize, &preparation.settings)
+            };
+            let turn_prefix_summary =
+                budget_summary(&preparation.turn_prefix_messages, &preparation.settings);
+            format!(
+                "{history_summary}\n\n---\n\n**Turn Context (split turn):**\n\n{turn_prefix_summary}"
+            )
+        } else {
+            budget_summary(&preparation.messages_to_summarize, &preparation.settings)
+        }
+    } else if preparation.is_split_turn && !preparation.turn_prefix_messages.is_empty() {
         let history_summary = if preparation.messages_to_summarize.is_empty() {
             "No prior history.".to_string()
         } else {
@@ -1441,6 +1517,90 @@ mod tests {
         assert!(!should_compact(89_999, 100_000, &settings));
         // 90001 should also trigger
         assert!(should_compact(90_001, 100_000, &settings));
+    }
+
+    // ── budget_summary (P2/#37: token-budget fast path) ─────────────
+
+    #[test]
+    fn budget_summary_includes_truncation_header() {
+        let settings = ResolvedCompactionSettings {
+            enabled: true,
+            reserve_tokens: 10_000,
+            keep_recent_tokens: 5_000,
+            ..Default::default()
+        };
+        let summary = budget_summary(&[make_user_text("hello")], &settings);
+        assert!(
+            summary.contains("token-budget fast path"),
+            "budget summary must carry the truncation header: {summary}"
+        );
+        assert!(summary.contains("hello"), "kept messages appear verbatim");
+    }
+
+    #[test]
+    fn budget_summary_keeps_most_recent_under_budget() {
+        // reserve_tokens=6 => budget 6 tokens. Each "aaaaaa" (6 chars) = 2
+        // tokens. Three messages = 6 tokens total, fits exactly — all kept.
+        let settings = ResolvedCompactionSettings {
+            enabled: true,
+            reserve_tokens: 6,
+            keep_recent_tokens: 5_000,
+            ..Default::default()
+        };
+        let msgs = vec![
+            make_user_text("aaaaaa"), // oldest, 2 tokens
+            make_user_text("bbbbbb"), // 2 tokens
+            make_user_text("cccccc"), // most recent, 2 tokens
+        ];
+        let summary = budget_summary(&msgs, &settings);
+        assert!(summary.contains("cccccc"), "most-recent kept");
+        assert!(summary.contains("bbbbbb"), "middle kept (within budget)");
+        assert!(summary.contains("aaaaaa"), "oldest kept (all fit)");
+    }
+
+    #[test]
+    fn budget_summary_drops_oldest_when_over_budget() {
+        // reserve_tokens=2 => budget 2 tokens. Each message is 2 tokens.
+        // Walk most-recent-first: keep "cccccc" (2, running=2), next "bbbbbb"
+        // would push to 4 > 2 and kept is non-empty → stop. So only the most
+        // recent survives.
+        let settings = ResolvedCompactionSettings {
+            enabled: true,
+            reserve_tokens: 2,
+            keep_recent_tokens: 5_000,
+            ..Default::default()
+        };
+        let msgs = vec![
+            make_user_text("aaaaaa"),
+            make_user_text("bbbbbb"),
+            make_user_text("cccccc"),
+        ];
+        let summary = budget_summary(&msgs, &settings);
+        assert!(summary.contains("cccccc"), "most-recent always kept");
+        assert!(!summary.contains("bbbbbb"), "middle dropped (over budget)");
+        assert!(!summary.contains("aaaaaa"), "oldest dropped");
+    }
+
+    #[test]
+    fn budget_summary_empty_messages_yields_only_header() {
+        let settings = ResolvedCompactionSettings {
+            enabled: true,
+            reserve_tokens: 10_000,
+            keep_recent_tokens: 5_000,
+            ..Default::default()
+        };
+        let summary = budget_summary(&[], &settings);
+        assert!(summary.contains("token-budget fast path"));
+        // No messages → the body after the header's trailing "\n\n" is empty.
+        // The summary is the header line plus nothing else (serialize_conversation
+        // of an empty message list is the empty string).
+        let body = summary.strip_prefix(
+            "_Conversation history truncated to fit the token budget \
+             (token-budget fast path; no LLM summary). Most-recent messages kept \
+             verbatim, oldest dropped._\n\n",
+        );
+        assert!(body.is_some(), "header must match exactly");
+        assert!(body.unwrap().is_empty(), "no messages => empty body");
     }
 
     // ── estimate_tokens ──────────────────────────────────────────────
@@ -2234,6 +2394,7 @@ mod tests {
             context_window_tokens: 100_000,
             reserve_tokens: 10_000, // threshold ≈ 90k, we have ~12 tokens
             keep_recent_tokens: 1,
+            token_budget_compact: false,
         };
         assert!(
             prepare_compaction(&entries, settings.clone()).is_none(),
@@ -2265,6 +2426,7 @@ mod tests {
             context_window_tokens: 64_000,
             reserve_tokens: 10_000,
             keep_recent_tokens: 12_800,
+            token_budget_compact: false,
         };
         assert!(
             prepare_compaction_force(&entries, settings).is_some(),
@@ -2309,6 +2471,7 @@ mod tests {
             context_window_tokens: 100_000,
             reserve_tokens: 1000,
             keep_recent_tokens: 100,
+            token_budget_compact: false,
         };
         let prep = prepare_compaction(&entries, settings);
         assert!(prep.is_some());
@@ -2333,6 +2496,7 @@ mod tests {
             context_window_tokens: 100_000,
             reserve_tokens: 1000,
             keep_recent_tokens: 100,
+            token_budget_compact: false,
         };
         let prep = prepare_compaction(&entries, settings);
         assert!(prep.is_some());
@@ -2425,6 +2589,7 @@ mod tests {
             context_window_tokens: 15,
             reserve_tokens: 0,
             keep_recent_tokens: 100,
+            token_budget_compact: false,
         };
 
         let prep = prepare_compaction(&entries, settings).expect("should compact");
@@ -2484,6 +2649,7 @@ mod tests {
             context_window_tokens: 200,
             reserve_tokens: 0,
             keep_recent_tokens: 150,
+            token_budget_compact: false,
         };
 
         // We use prepare_compaction as the entry point
@@ -2557,6 +2723,7 @@ mod tests {
                     context_window_tokens: window,
                     reserve_tokens: 16_384,
                     keep_recent_tokens: 20_000,
+                    token_budget_compact: false,
                 };
                 assert!(!should_compact(ctx_tokens, window, &settings));
             }
@@ -2573,6 +2740,7 @@ mod tests {
                     context_window_tokens: window,
                     reserve_tokens: reserve,
                     keep_recent_tokens: 20_000,
+                    token_budget_compact: false,
                 };
                 let threshold = u64::from(window).saturating_sub(u64::from(reserve));
                 let result = should_compact(ctx_tokens, window, &settings);

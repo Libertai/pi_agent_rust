@@ -6742,6 +6742,7 @@ export default function init(pi) {
                 enabled: Some(true),
                 reserve_tokens: Some(2),
                 keep_recent_tokens: Some(1),
+                token_budget_compact: None,
             });
 
             let auth_dir = tempfile::tempdir().expect("tempdir");

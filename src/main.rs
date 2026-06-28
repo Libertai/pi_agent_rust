@@ -1255,6 +1255,7 @@ async fn run(
         enabled: config.compaction_enabled(),
         reserve_tokens: config.compaction_reserve_tokens(),
         keep_recent_tokens: config.compaction_keep_recent_tokens(),
+        token_budget_compact: config.compaction_token_budget_compact(),
         context_window_tokens: context_window_tokens_for_entry(&selection.model_entry),
     };
     let mut agent_session = AgentSession::new(

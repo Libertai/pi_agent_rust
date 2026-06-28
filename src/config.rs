@@ -244,6 +244,13 @@ pub struct CompactionSettings {
     pub reserve_tokens: Option<u32>,
     #[serde(alias = "keepRecentTokens")]
     pub keep_recent_tokens: Option<u32>,
+    /// (P2 / #37) Token-budget compaction fast path — skip the LLM
+    /// summarisation round-trip and keep a budget-bounded verbatim
+    /// transcript of the most-recent messages instead. `None` falls back to
+    /// the default (`false` = LLM summarisation). Mirrors Codex's
+    /// `compact_token_budget.rs`.
+    #[serde(alias = "tokenBudgetCompact")]
+    pub token_budget_compact: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -583,6 +590,16 @@ impl Config {
             .as_ref()
             .and_then(|c| c.keep_recent_tokens)
             .unwrap_or(20000)
+    }
+
+    /// (P2 / #37) Token-budget compaction fast path. Defaults to `false`
+    /// (LLM summarisation); opt in via config or the per-session
+    /// `SessionOptions::compaction_token_budget_compact` override.
+    pub fn compaction_token_budget_compact(&self) -> bool {
+        self.compaction
+            .as_ref()
+            .and_then(|c| c.token_budget_compact)
+            .unwrap_or(false)
     }
 
     pub fn branch_summary_reserve_tokens(&self) -> u32 {
@@ -1075,6 +1092,7 @@ fn merge_compaction(
             enabled: other.enabled.or(base.enabled),
             reserve_tokens: other.reserve_tokens.or(base.reserve_tokens),
             keep_recent_tokens: other.keep_recent_tokens.or(base.keep_recent_tokens),
+            token_budget_compact: other.token_budget_compact.or(base.token_budget_compact),
         }),
         (None, Some(other)) => Some(other),
         (Some(base), None) => Some(base),
@@ -2151,6 +2169,7 @@ mod tests {
                 enabled: Some(true),
                 reserve_tokens: Some(1000),
                 keep_recent_tokens: Some(2000),
+                token_budget_compact: Some(false),
             }),
             ..Config::default()
         };
@@ -3148,7 +3167,7 @@ mod tests {
                 reserve in prop::option::of(1u32..100_000),
                 keep in prop::option::of(1u32..100_000),
             ) {
-                let base = CompactionSettings { enabled, reserve_tokens: reserve, keep_recent_tokens: keep };
+                let base = CompactionSettings { enabled, reserve_tokens: reserve, keep_recent_tokens: keep, token_budget_compact: None };
                 let result = merge_compaction(Some(base.clone()), None).unwrap();
                 assert_eq!(result.enabled, base.enabled);
                 assert_eq!(result.reserve_tokens, base.reserve_tokens);
@@ -3161,7 +3180,7 @@ mod tests {
                 reserve in prop::option::of(1u32..100_000),
                 keep in prop::option::of(1u32..100_000),
             ) {
-                let other = CompactionSettings { enabled, reserve_tokens: reserve, keep_recent_tokens: keep };
+                let other = CompactionSettings { enabled, reserve_tokens: reserve, keep_recent_tokens: keep, token_budget_compact: None };
                 let result = merge_compaction(None, Some(other.clone())).unwrap();
                 assert_eq!(result.enabled, other.enabled);
                 assert_eq!(result.reserve_tokens, other.reserve_tokens);
@@ -3175,8 +3194,8 @@ mod tests {
                 o_en in prop::option::of(any::<bool>()),
                 o_res in prop::option::of(1u32..100_000),
             ) {
-                let base = CompactionSettings { enabled: b_en, reserve_tokens: b_res, keep_recent_tokens: None };
-                let other = CompactionSettings { enabled: o_en, reserve_tokens: o_res, keep_recent_tokens: None };
+                let base = CompactionSettings { enabled: b_en, reserve_tokens: b_res, keep_recent_tokens: None, token_budget_compact: None };
+                let other = CompactionSettings { enabled: o_en, reserve_tokens: o_res, keep_recent_tokens: None, token_budget_compact: None };
                 let result = merge_compaction(Some(base), Some(other)).unwrap();
                 assert_eq!(result.enabled, o_en.or(b_en));
                 assert_eq!(result.reserve_tokens, o_res.or(b_res));
