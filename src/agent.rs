@@ -8734,6 +8734,10 @@ impl AgentSession {
                 reason: format!("threshold;admission={}", admission.reason.as_str()),
             });
 
+            // (P3) Time the compaction work (AutoCompactionStart → End) so the
+            // payload's `durationMs` is a real wall-clock figure.
+            let compact_start = std::time::Instant::now();
+
             let before_outcome = self.dispatch_before_compact(&prep, &entries, None).await;
             if before_outcome.cancel {
                 on_event(AgentEvent::AutoCompactionEnd {
@@ -8746,26 +8750,29 @@ impl AgentSession {
             }
 
             if let Some(compaction) = before_outcome.compaction {
-                let result_value = Some(Self::auto_compaction_result_payload(
-                    compaction.summary.clone(),
-                    compaction.first_kept_entry_id.clone(),
-                    compaction.tokens_before,
-                    compaction.details.clone(),
-                ));
                 self.extensions_is_compacting
                     .store(true, std::sync::atomic::Ordering::SeqCst);
                 let apply_result = self
                     .apply_compaction_entry(
-                        compaction.summary,
-                        compaction.first_kept_entry_id,
+                        compaction.summary.clone(),
+                        compaction.first_kept_entry_id.clone(),
                         compaction.tokens_before,
-                        compaction.details,
+                        compaction.details.clone(),
                         true,
                     )
                     .await;
                 self.extensions_is_compacting
                     .store(false, std::sync::atomic::Ordering::SeqCst);
-                apply_result?;
+                let tokens_after = apply_result?;
+                let result_value = Some(Self::auto_compaction_result_payload(
+                    compaction.summary,
+                    compaction.first_kept_entry_id,
+                    compaction.tokens_before,
+                    compaction.details,
+                    tokens_after,
+                    Self::compaction_duration_ms(compact_start),
+                    "threshold",
+                ));
                 on_event(AgentEvent::AutoCompactionEnd {
                     result: result_value,
                     aborted: false,
@@ -8819,11 +8826,21 @@ impl AgentSession {
         Ok(runtime_handle)
     }
 
+    /// (P3) Wall-clock duration in ms, clamped to u64. `Duration::as_millis`
+    /// returns u128; clamping (not casting) avoids the truncation lint and is
+    /// correct for any realistic compaction duration (the clamp is ~584M years).
+    fn compaction_duration_ms(start: std::time::Instant) -> u64 {
+        u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
     fn auto_compaction_result_payload(
         summary: String,
         first_kept_entry_id: String,
         tokens_before: u64,
         details: Option<Value>,
+        tokens_after: Option<u64>,
+        duration_ms: u64,
+        trigger: &str,
     ) -> Value {
         let mut payload = serde_json::Map::new();
         payload.insert("summary".to_string(), Value::String(summary));
@@ -8832,6 +8849,19 @@ impl AgentSession {
             Value::String(first_kept_entry_id),
         );
         payload.insert("tokensBefore".to_string(), Value::from(tokens_before));
+        // (P3) Post-compaction metadata so downstream embedders (libertai's
+        // #31 PostCompact surfacing) can print "142k→31k (−111k, 2.1s)"
+        // from real numbers instead of a computed proxy. `tokensAfter` is
+        // optional — the background-worker path can't cheaply re-measure the
+        // session it doesn't own, so it omits the field (the embedder treats
+        // None as "unknown"). `durationMs` is the wall-clock the compaction
+        // work took (LLM summarisation + apply), measured by the caller.
+        // `trigger` is "threshold" (auto) or "manual" (user `/compact`).
+        if let Some(tokens_after) = tokens_after {
+            payload.insert("tokensAfter".to_string(), Value::from(tokens_after));
+        }
+        payload.insert("durationMs".to_string(), Value::from(duration_ms));
+        payload.insert("trigger".to_string(), Value::String(trigger.to_string()));
         if let Some(details) = details {
             payload.insert("details".to_string(), details);
         }
@@ -8845,7 +8875,7 @@ impl AgentSession {
         tokens_before: u64,
         details: Option<Value>,
         from_extension: bool,
-    ) -> Result<()> {
+    ) -> Result<Option<u64>> {
         let cx = crate::agent_cx::AgentCx::for_request();
         let mut session = self
             .session
@@ -8875,6 +8905,17 @@ impl AgentSession {
                 None
             }
         });
+
+        // (P3) Measure the post-compaction context-token count while we still
+        // hold the session lock: the just-appended compaction summary replaces
+        // the summarised history, so this is the "after" figure the
+        // AutoCompactionEnd payload reports as `tokensAfter`. Computed from
+        // the same estimator as `tokens_before` (estimate_context_tokens_for_
+        // entries) so the two are directly comparable.
+        let tokens_after = {
+            let entries = session.entries_for_current_path();
+            Some(compaction::estimate_context_tokens_for_entries(&entries))
+        };
         drop(session);
 
         if let (Some(region), Some(compaction_entry)) = (&self.extensions, compaction_entry) {
@@ -8891,7 +8932,7 @@ impl AgentSession {
             }
         }
 
-        Ok(())
+        Ok(tokens_after)
     }
 
     /// Apply a completed compaction result to the session.
@@ -8901,21 +8942,33 @@ impl AgentSession {
         on_event: AgentEventHandler,
     ) -> Result<()> {
         let details = Some(compaction::compaction_details_to_value(&result.details)?);
-        let result_value = Some(Self::auto_compaction_result_payload(
-            result.summary.clone(),
-            result.first_kept_entry_id.clone(),
-            result.tokens_before,
-            details.clone(),
-        ));
 
-        self.apply_compaction_entry(
+        // (P3) The background-worker path: the LLM summarisation ran on the
+        // compaction worker thread, so we can't measure its wall-clock here.
+        // `durationMs` is 0 (honest "not measured for this path" — the
+        // embedder treats 0 as unknown, same as a missing field); `trigger`
+        // is "threshold" (background compaction is always threshold-driven).
+        // `tokensAfter` is measured by apply_compaction_entry after the
+        // summary is appended.
+        let apply_start = std::time::Instant::now();
+        let tokens_after = self
+            .apply_compaction_entry(
+                result.summary.clone(),
+                result.first_kept_entry_id.clone(),
+                result.tokens_before,
+                details.clone(),
+                false,
+            )
+            .await?;
+        let result_value = Some(Self::auto_compaction_result_payload(
             result.summary,
             result.first_kept_entry_id,
             result.tokens_before,
             details,
-            false,
-        )
-        .await?;
+            tokens_after,
+            Self::compaction_duration_ms(apply_start),
+            "threshold",
+        ));
 
         on_event(AgentEvent::AutoCompactionEnd {
             result: result_value,
@@ -8952,6 +9005,7 @@ impl AgentSession {
             .await
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn compact_synchronous_inner(
         &self,
         on_event: AgentEventHandler,
@@ -8992,6 +9046,12 @@ impl AgentSession {
                 reason: "threshold".to_string(),
             });
 
+            // (P3) Time the compaction work + pick the trigger label: `force`
+            // means a user-initiated `/compact` (manual); otherwise this is
+            // the synchronous threshold path (auto).
+            let compact_start = std::time::Instant::now();
+            let trigger = if force { "manual" } else { "threshold" };
+
             let before_outcome = self
                 .dispatch_before_compact(&prep, &entries, custom_instructions)
                 .await;
@@ -9006,26 +9066,29 @@ impl AgentSession {
             }
 
             if let Some(compaction) = before_outcome.compaction {
-                let result_value = Some(Self::auto_compaction_result_payload(
-                    compaction.summary.clone(),
-                    compaction.first_kept_entry_id.clone(),
-                    compaction.tokens_before,
-                    compaction.details.clone(),
-                ));
                 self.extensions_is_compacting
                     .store(true, std::sync::atomic::Ordering::SeqCst);
                 let apply_result = self
                     .apply_compaction_entry(
-                        compaction.summary,
-                        compaction.first_kept_entry_id,
+                        compaction.summary.clone(),
+                        compaction.first_kept_entry_id.clone(),
                         compaction.tokens_before,
-                        compaction.details,
+                        compaction.details.clone(),
                         true,
                     )
                     .await;
                 self.extensions_is_compacting
                     .store(false, std::sync::atomic::Ordering::SeqCst);
-                apply_result?;
+                let tokens_after = apply_result?;
+                let result_value = Some(Self::auto_compaction_result_payload(
+                    compaction.summary,
+                    compaction.first_kept_entry_id,
+                    compaction.tokens_before,
+                    compaction.details,
+                    tokens_after,
+                    Self::compaction_duration_ms(compact_start),
+                    trigger,
+                ));
                 on_event(AgentEvent::AutoCompactionEnd {
                     result: result_value,
                     aborted: false,
