@@ -6224,10 +6224,14 @@ mod extensions_integration_tests {
                     guard.push(event);
                 }
             });
-            let (output, is_error) = agent_session
+            let (output, is_error) = match agent_session
                 .agent
                 .execute_tool(tool_call, on_event, test_turn_latency())
-                .await;
+                .await
+            {
+                ToolRunResult::Done { output, is_error } => (output, is_error),
+                _ => panic!("expected Done"),
+            };
 
             assert!(!is_error);
             assert!(!output.is_error);
@@ -6286,10 +6290,14 @@ mod extensions_integration_tests {
             };
 
             let on_event: Arc<dyn Fn(AgentEvent) + Send + Sync> = Arc::new(|_| {});
-            let (output, is_error) = agent_session
+            let (output, is_error) = match agent_session
                 .agent
                 .execute_tool(tool_call, on_event, test_turn_latency())
-                .await;
+                .await
+            {
+                ToolRunResult::Done { output, is_error } => (output, is_error),
+                _ => panic!("expected Done"),
+            };
 
             assert!(is_error);
             assert!(output.is_error);

@@ -9083,6 +9083,13 @@ mod tests {
             .unwrap_or("")
     }
 
+    fn expect_done(execution: ToolExecution) -> ToolOutput {
+        match execution {
+            ToolExecution::Done(output) => output,
+            ToolExecution::Paused { .. } => panic!("expected Done"),
+        }
+    }
+
     fn artifact_json(details: Option<&serde_json::Value>) -> &serde_json::Value {
         details
             .and_then(|value| value.get("artifact"))
@@ -9295,7 +9302,7 @@ mod tests {
                     serde_json::json!({ "path": "large.txt" }),
                     None,
                 )
-                .await
+                .await.map(expect_done)
                 .expect("read large file");
 
             assert!(first_text(&output).contains("Full tool output artifact:"));
@@ -9352,7 +9359,7 @@ mod tests {
                     }),
                     None,
                 )
-                .await
+                .await.map(expect_done)
                 .expect("bash large output");
 
             assert!(first_text(&output).contains("Full tool output artifact:"));
@@ -9387,7 +9394,7 @@ mod tests {
                     }),
                     None,
                 )
-                .await
+                .await.map(expect_done)
                 .expect("bash large output");
 
             assert!(first_text(&output).contains("Full tool output artifact:"));
@@ -9430,7 +9437,7 @@ mod tests {
                     }),
                     None,
                 )
-                .await
+                .await.map(expect_done)
                 .expect("grep large output");
 
             assert!(first_text(&output).contains("Full tool output artifact:"));
@@ -9503,7 +9510,7 @@ mod tests {
                     serde_json::json!({ "path": ".", "limit": 4500 }),
                     None,
                 )
-                .await
+                .await.map(expect_done)
                 .expect("ls large directory");
 
             assert!(first_text(&output).contains("Full tool output artifact:"));
@@ -9531,23 +9538,42 @@ mod tests {
         let read_input = serde_json::json!({ "path": "note.txt" });
         let first = read_tool
             .execute("read-1", read_input.clone(), None)
-            .await
+            .await.map(expect_done)
             .expect("first read");
         assert!(first_text(&first).contains("alpha"));
 
-        let hits_before = tool_output_cache_stats_for_tests().hits;
+        // Fork semantics: an identical repeated read is intercepted by the
+        // read-dedup guard (FileToolState::observe_read) BEFORE the output
+        // cache can serve it — the model gets a "reuse the prior result"
+        // stub instead of the cached payload. The output cache still covers
+        // grep/find/ls (no dedup there); for `read` it only matters when
+        // the dedup record was reset by an mtime change, in which case the
+        // cache dependency changed too, so it never replays a stale body.
         let second = read_tool
             .execute("read-2", read_input.clone(), None)
-            .await
-            .expect("cached read");
-        assert_eq!(first_text(&first), first_text(&second));
-        assert!(tool_output_cache_stats_for_tests().hits > hits_before);
+            .await.map(expect_done)
+            .expect("deduped read");
+        assert!(
+            first_text(&second).contains("unchanged since the previous read"),
+            "expected dedup stub, got: {}",
+            first_text(&second)
+        );
+        assert_eq!(
+            second
+                .details
+                .as_ref()
+                .and_then(|details| details.get("deduplicated"))
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
 
+        // Rewriting the file bumps its mtime: the dedup record resets and
+        // the cache dependency changes, so a fresh read runs.
         let invalidations_before = tool_output_cache_stats_for_tests().invalidations;
         std::fs::write(&note, "beta\n").expect("rewrite note");
         let third = read_tool
             .execute("read-3", read_input.clone(), None)
-            .await
+            .await.map(expect_done)
             .expect("invalidated read");
         assert!(first_text(&third).contains("beta"));
         assert!(!first_text(&third).contains("alpha"));
@@ -9559,14 +9585,14 @@ mod tests {
         let ls_input = serde_json::json!({ "path": "." });
         let ls_first = ls_tool
             .execute("ls-1", ls_input.clone(), None)
-            .await
+            .await.map(expect_done)
             .expect("first ls");
         assert!(first_text(&ls_first).contains("note.txt"));
 
         let hits_before = tool_output_cache_stats_for_tests().hits;
         let ls_second = ls_tool
             .execute("ls-2", ls_input.clone(), None)
-            .await
+            .await.map(expect_done)
             .expect("cached ls");
         assert_eq!(first_text(&ls_first), first_text(&ls_second));
         assert!(tool_output_cache_stats_for_tests().hits > hits_before);
@@ -9575,7 +9601,7 @@ mod tests {
         std::fs::write(tmp.join("new.txt"), "new\n").expect("write new file");
         let ls_third = ls_tool
             .execute("ls-3", ls_input.clone(), None)
-            .await
+            .await.map(expect_done)
             .expect("invalidated ls");
         assert!(first_text(&ls_third).contains("new.txt"));
         assert!(tool_output_cache_stats_for_tests().invalidations > invalidations_before);
@@ -9592,14 +9618,14 @@ mod tests {
 
         let grep_first = grep_tool
             .execute("grep-1", grep_input.clone(), None)
-            .await
+            .await.map(expect_done)
             .expect("first grep");
         assert!(first_text(&grep_first).contains("a.txt"));
 
         let hits_before = tool_output_cache_stats_for_tests().hits;
         let grep_second = grep_tool
             .execute("grep-2", grep_input.clone(), None)
-            .await
+            .await.map(expect_done)
             .expect("cached grep");
         assert_eq!(first_text(&grep_first), first_text(&grep_second));
         assert!(tool_output_cache_stats_for_tests().hits > hits_before);
@@ -9608,7 +9634,7 @@ mod tests {
         std::fs::write(tmp.join("b.txt"), "needle\n").expect("write new match");
         let grep_third = grep_tool
             .execute("grep-3", grep_input.clone(), None)
-            .await
+            .await.map(expect_done)
             .expect("invalidated grep");
         assert!(first_text(&grep_third).contains("b.txt"));
         assert!(tool_output_cache_stats_for_tests().invalidations > invalidations_before);
@@ -9625,14 +9651,14 @@ mod tests {
 
         let find_first = find_tool
             .execute("find-1", find_input.clone(), None)
-            .await
+            .await.map(expect_done)
             .expect("first find");
         assert!(first_text(&find_first).contains("find-a.txt"));
 
         let hits_before = tool_output_cache_stats_for_tests().hits;
         let find_second = find_tool
             .execute("find-2", find_input.clone(), None)
-            .await
+            .await.map(expect_done)
             .expect("cached find");
         assert_eq!(first_text(&find_first), first_text(&find_second));
         assert!(tool_output_cache_stats_for_tests().hits > hits_before);
@@ -9641,7 +9667,7 @@ mod tests {
         std::fs::write(tmp.join("find-b.txt"), "find\n").expect("write second find file");
         let find_third = find_tool
             .execute("find-3", find_input.clone(), None)
-            .await
+            .await.map(expect_done)
             .expect("invalidated find");
         assert!(first_text(&find_third).contains("find-b.txt"));
         assert!(tool_output_cache_stats_for_tests().invalidations > invalidations_before);
@@ -12100,7 +12126,7 @@ keep NOT_A_SECRET=visible";
             let tool = GrepTool::new(&link);
             let out = tool
                 .execute("t", serde_json::json!({ "pattern": "needle" }), None)
-                .await
+                .await.map(expect_done)
                 .unwrap();
 
             let text = get_text(&out.content);

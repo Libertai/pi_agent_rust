@@ -5898,6 +5898,7 @@ mod tests {
             })),
             is_error: false,
             timestamp: Some(0),
+            paused: None,
         }
     }
 
@@ -7873,6 +7874,7 @@ mod tests {
             })),
             is_error: false,
             timestamp: Some(12346),
+            paused: None,
         });
 
         run_async(async { session.save().await }).unwrap();
