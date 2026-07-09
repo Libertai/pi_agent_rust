@@ -1436,46 +1436,6 @@ impl AgentSessionHandle {
         self.session.set_thinking_level(level).await
     }
 
-    /// Update the persisted session display name.
-    ///
-    /// Records a `SessionInfo` entry with the new name on the leaf path and
-    /// flushes session metadata to disk, mirroring how the in-process rename
-    /// path works for runtime CLIs that need to retitle a live session.
-    pub async fn set_session_name(&mut self, name: impl Into<String>) -> Result<()> {
-        let name = name.into();
-        let cx = crate::agent_cx::AgentCx::for_request();
-        {
-            let mut guard = self
-                .session
-                .session
-                .lock(cx.cx())
-                .await
-                .map_err(|e| Error::session(e.to_string()))?;
-            guard.append_session_info(Some(name));
-        }
-        self.session.persist_session().await
-    }
-
-    /// Read the per-prompt `max_tokens` cap currently configured on the
-    /// session's stream options.
-    ///
-    /// `None` means the provider's default applies (e.g. 4096 for the
-    /// openai-compat provider), which can truncate generations that emit
-    /// large tool-call arguments. Embedders carrying tool-heavy traffic
-    /// should raise this via [`Self::set_max_tokens`].
-    pub const fn max_tokens(&self) -> Option<u32> {
-        self.session.agent.stream_options().max_tokens
-    }
-
-    /// Override the per-prompt `max_tokens` cap.
-    ///
-    /// Persists for the lifetime of the in-process handle only; not written
-    /// to session metadata. Pass `None` to fall back to the provider's
-    /// default cap.
-    pub const fn set_max_tokens(&mut self, max_tokens: Option<u32>) {
-        self.session.agent.stream_options_mut().max_tokens = max_tokens;
-    }
-
     /// Return all model messages for the current session path.
     pub async fn messages(&self) -> Result<Vec<Message>> {
         let cx = crate::agent_cx::AgentCx::for_request();
